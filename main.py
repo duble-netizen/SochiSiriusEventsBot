@@ -18,7 +18,7 @@ import uvicorn
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("sochi_events_bot")
 
-BOT_VERSION = "1.4.1"
+BOT_VERSION = "1.6.0"
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is not set")
@@ -28,6 +28,8 @@ bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
 EVENTS = []
 LAST_UPDATE = None
+CALENDAR_LOG_FILE = os.getenv("CALENDAR_LOG_FILE", "calendar_added_today.json")
+CALENDAR_ADDED_LOG = []
 
 # Фильтры хранятся отдельно для каждого пользователя Telegram.
 # По умолчанию выбраны все города и оба типа мероприятий.
@@ -46,6 +48,13 @@ SOURCES = [
     {"name": "Сириус Автодром", "url": "https://siriusautodrom.ru/fest2026", "area": "Сириус", "official": True},
     {"name": "Курорт Красная Поляна", "url": "https://krasnayapolyanaresort.ru/events", "area": "Красная Поляна", "official": True},
     {"name": "Сочи Парк", "url": "https://www.sochipark.ru/programma/", "area": "Сочи", "official": True},
+    {"name": "КЗ «Фестивальный»", "url": "https://www.festivalniy.com/", "area": "Сочи", "official": True},
+    {"name": "КЗ «Фестивальный» — афиша ДК Сочи", "url": "https://www.dksochi.ru/playbill/festivalnii", "area": "Сочи", "official": True},
+    {"name": "Зимний театр — афиша ДК Сочи", "url": "https://www.dksochi.ru/playbill/zimnii-teatr", "area": "Сочи", "official": True},
+    {"name": "Зимний театр — Яндекс Афиша", "url": "https://afisha.yandex.ru/sochi/theatre/places/zimnii-teatr/schedule", "area": "Сочи", "official": False},
+    {"name": "Афиша Фестивального — Яндекс Афиша", "url": "https://afisha.yandex.ru/sochi/concert/places/festivalnyi/schedule", "area": "Сочи", "official": False},
+    {"name": "Афиша Сочи — локальный агрегатор", "url": "https://afisha-sochi.com/", "area": "Сочи", "official": False},
+    {"name": "ИНТЦ «Сириус»", "url": "https://intc.sirius.ru/", "area": "Сириус", "official": True},
 ]
 
 
@@ -420,6 +429,63 @@ def get_user_filters(user_id):
     return USER_FILTERS[user_id]
 
 
+def load_calendar_added_log():
+    """Загружает журнал событий, которые бот фактически добавил в календарь."""
+    global CALENDAR_ADDED_LOG
+    try:
+        if os.path.exists(CALENDAR_LOG_FILE):
+            with open(CALENDAR_LOG_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                CALENDAR_ADDED_LOG = data if isinstance(data, list) else []
+        else:
+            CALENDAR_ADDED_LOG = []
+    except Exception:
+        logger.exception("Не удалось загрузить журнал добавлений в календарь")
+        CALENDAR_ADDED_LOG = []
+
+
+def record_calendar_added(event):
+    """Записывает факт реального добавления события в календарь.
+
+    Эту функцию вызывает модуль синхронизации с Outlook после успешного создания
+    события. Само обнаружение мероприятия в интернете сюда не записывается.
+    """
+    global CALENDAR_ADDED_LOG
+    item = {
+        "added_at": datetime.now().isoformat(),
+        "title": event.get("title", ""),
+        "date": event.get("date").isoformat() if event.get("date") else "",
+        "area": event.get("area", ""),
+        "location": event.get("location", ""),
+        "status": event.get("status", "⚠️ НЕ ПОДТВЕРЖДЕНО"),
+        "source": event.get("source", ""),
+    }
+    CALENDAR_ADDED_LOG.append(item)
+    # Храним журнал за последние 31 день, чтобы файл не рос бесконечно.
+    cutoff = datetime.now() - timedelta(days=31)
+    CALENDAR_ADDED_LOG = [
+        x for x in CALENDAR_ADDED_LOG
+        if x.get("added_at") and datetime.fromisoformat(x["added_at"]) >= cutoff
+    ]
+    try:
+        with open(CALENDAR_LOG_FILE, "w", encoding="utf-8") as f:
+            json.dump(CALENDAR_ADDED_LOG, f, ensure_ascii=False, indent=2)
+    except Exception:
+        logger.exception("Не удалось сохранить журнал добавлений в календарь")
+
+
+def calendar_added_today():
+    today = datetime.now().date()
+    result = []
+    for item in CALENDAR_ADDED_LOG:
+        try:
+            if datetime.fromisoformat(item["added_at"]).date() == today:
+                result.append(item)
+        except Exception:
+            continue
+    return sorted(result, key=lambda x: x.get("added_at", ""), reverse=True)
+
+
 def toggle_filter(user_id, kind, value):
     filters = get_user_filters(user_id)
     selected = filters[kind]
@@ -509,6 +575,38 @@ async def version_cmd(message: Message):
 @dp.message(Command("help"))
 async def help_cmd(message: Message):
     await message.answer("Команды:\n/today — сегодня\n/tomorrow — завтра\n/week — ближайшие 7 дней\n\nАфиша автоматически обновляется при каждом запуске бота и затем каждые 30 минут.", reply_markup=menu(message.from_user.id))
+
+
+@dp.message(Command("new"))
+@dp.message(lambda m: m.text == "Новое")
+async def new_events(message: Message):
+    items = calendar_added_today()
+    if not items:
+        await message.answer(
+            "<b>Новое</b>\n\nСегодня бот пока ничего не добавил в календарь.",
+            reply_markup=menu(message.from_user.id),
+            parse_mode="HTML",
+        )
+        return
+
+    parts = [f"<b>Новое за сегодня</b>\nДобавлено в календарь: <b>{len(items)}</b>\n"]
+    for item in items:
+        dt = item.get("date", "")
+        try:
+            event_dt = datetime.fromisoformat(dt)
+            date_text = event_dt.strftime("%d.%m.%Y")
+            time_text = event_dt.strftime("%H:%M") if event_dt.hour or event_dt.minute else "время не указано"
+        except Exception:
+            date_text, time_text = dt, ""
+        location = item.get("location") or item.get("area") or "Место не указано"
+        status = item.get("status") or "⚠️ НЕ ПОДТВЕРЖДЕНО"
+        parts.append(
+            f"<b>{escape(item.get('title', 'Без названия'))}</b>\n"
+            f"📅 {date_text} {time_text}\n"
+            f"📍 {escape(location)}\n"
+            f"{escape(status)}"
+        )
+    await message.answer("\n\n────────────\n\n".join(parts), reply_markup=menu(message.from_user.id), parse_mode="HTML")
 
 
 @dp.message(Command("today"))
@@ -602,6 +700,7 @@ async def bot_loop():
 
 
 async def main():
+    load_calendar_added_log()
     await collect_events()
     collector_task = asyncio.create_task(collector_loop())
     bot_task = asyncio.create_task(bot_loop())
