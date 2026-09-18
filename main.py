@@ -18,7 +18,7 @@ import uvicorn
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("sochi_events_bot")
 
-BOT_VERSION = "1.2.0"
+BOT_VERSION = "1.2.2"
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is not set")
@@ -242,11 +242,8 @@ def grouped_event_blocks(events):
 
 def menu():
     return ReplyKeyboardMarkup(keyboard=[
-        [KeyboardButton(text="Сегодня"), KeyboardButton(text="Завтра")],
-        [KeyboardButton(text="7 дней")],
-        [KeyboardButton(text="Сочи"), KeyboardButton(text="Сириус")],
-        [KeyboardButton(text="Неподтверждённые")],
-        [KeyboardButton(text="Обновить афишу")],
+        [KeyboardButton(text="Сегодня"), KeyboardButton(text="Завтра"), KeyboardButton(text="7 дней")],
+        [KeyboardButton(text="Сочи"), KeyboardButton(text="Сириус"), KeyboardButton(text="Красная Поляна")],
     ], resize_keyboard=True)
 
 
@@ -275,7 +272,7 @@ async def send_events(message: Message, events, title, group_by_date=False):
     if current_events:
         chunks.append((current_parts, current_events))
     for text_parts, chunk_events in chunks:
-        await message.answer("\n\n────────────\n\n".join(text_parts), reply_markup=event_keyboard(chunk_events), parse_mode="HTML")
+        await message.answer("\n\n────────────\n\n".join(text_parts), reply_markup=None, parse_mode="HTML")
     await message.answer("Выберите следующий раздел", reply_markup=menu())
 
 
@@ -291,7 +288,7 @@ async def version_cmd(message: Message):
 
 @dp.message(Command("help"))
 async def help_cmd(message: Message):
-    await message.answer("Команды:\n/today — сегодня\n/tomorrow — завтра\n/week — ближайшие 7 дней\n\nКнопка «Обновить афишу» запускает сбор данных прямо сейчас.", reply_markup=menu())
+    await message.answer("Команды:\n/today — сегодня\n/tomorrow — завтра\n/week — ближайшие 7 дней\n\nАфиша автоматически обновляется при каждом запуске бота и затем каждые 30 минут.", reply_markup=menu())
 
 
 @dp.message(Command("today"))
@@ -325,17 +322,10 @@ async def sirius(message: Message):
     await send_events(message, [e for e in EVENTS if e["location"].lower() == "сириус"], "Сириус")
 
 
-@dp.message(lambda m: m.text == "Неподтверждённые")
-async def unconfirmed(message: Message):
-    await send_events(message, [e for e in EVENTS if not e["confirmed"]], "Неподтверждённые")
-
-
-@dp.message(lambda m: m.text == "Обновить афишу")
-async def refresh(message: Message):
-    await message.answer("<b>Обновляю афишу...</b>", parse_mode="HTML")
-    errors = await collect_events()
-    extra = "\n\nНекоторые источники временно недоступны." if errors else ""
-    await message.answer(f"<b>Готово.</b> Найдено мероприятий: <b>{len(EVENTS)}</b>{extra}", reply_markup=menu(), parse_mode="HTML")
+@dp.message(lambda m: m.text == "Красная Поляна")
+async def krasnaya_polyana(message: Message):
+    matches = [e for e in EVENTS if "красн" in e["location"].lower() or "роза хутор" in e["location"].lower() or "газпром" in e["location"].lower()]
+    await send_events(message, matches, "Красная Поляна")
 
 
 @app.get("/")
