@@ -18,7 +18,7 @@ import uvicorn
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("sochi_events_bot")
 
-BOT_VERSION = "1.3.0"
+BOT_VERSION = "1.4.0"
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is not set")
@@ -28,6 +28,10 @@ bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
 EVENTS = []
 LAST_UPDATE = None
+
+# Фильтры хранятся отдельно для каждого пользователя Telegram.
+# По умолчанию выбраны все города и оба типа мероприятий.
+USER_FILTERS = {}
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/140.0 Safari/537.36"
@@ -192,6 +196,7 @@ def parse_sitemap_like_events(soup, source):
                                 "source": source["name"],
                                 "url": urljoin(source["url"], obj.get("url") or source["url"]),
                                 "confirmed": source["official"],
+                                "event_type": classify_event(title, json.dumps(obj, ensure_ascii=False)),
                             })
     return found
 
@@ -245,9 +250,60 @@ def extract_from_source(source):
             "source": source["name"],
             "url": absolute,
             "confirmed": source["official"],
+            "event_type": classify_event(title, block),
         })
     return found
 
+
+
+def classify_event(title: str, source_text: str = "") -> str:
+    """Определяет, относится ли запись к разовым или постоянным/длительным.
+
+    Важно: само слово «фестиваль» или «турнир» не делает событие длительным.
+    Длительным оно считается, если источник указывает период/регулярность,
+    либо по названию явно видно, что это постоянная услуга/объект.
+    """
+    text = clean(f"{title} {source_text}").lower()
+
+    # Явная регулярность: каждый день, по выходным, конкретные дни недели и т.п.
+    recurring = [
+        "каждый день", "ежедневно", "ежедневный", "ежедневная", "ежедневное",
+        "каждую неделю", "каждый понедельник", "каждый вторник",
+        "каждую среду", "каждый четверг", "каждую пятницу",
+        "каждую субботу", "каждое воскресенье", "по выходным",
+        "по будням", "еженедельно", "регулярно",
+    ]
+    if any(x in text for x in recurring):
+        return "Постоянные"
+
+    # Период: «с 18 по 30 сентября», «18 сентября — 5 октября» и т.п.
+    has_range = bool(re.search(
+        r"\bс\s+\d{1,2}\s+(?:января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)"
+        r"\s+(?:по|до|—|–|-)+\s+\d{1,2}\s+(?:января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)",
+        text,
+    )) or bool(re.search(r"\b\d{1,2}[./]\d{1,2}\s*[—–-]\s*\d{1,2}[./]\d{1,2}\b", text))
+    if has_range:
+        return "Постоянные"
+
+    # Постоянные услуги/объекты, которые обычно представлены в афише как
+    # доступные в течение длительного периода.
+    permanent_keywords = [
+        "плавание с дельфинами", "дельфинар", "океанариум", "аквариум",
+        "экскурсия", "экскурсии", "музей", "экспозиция", "аттракцион",
+        "канатная дорога", "парк развлечений", "катание на лошадях",
+        "прокат", "посещение", "шоу-программа",
+    ]
+    if any(x in text for x in permanent_keywords):
+        return "Постоянные"
+
+    # Выставка/ярмарка/проект без явной даты окончания остаются разовыми,
+    # если источник не сообщил период. Так мы не будем автоматически
+    # превращать любое однодневное мероприятие в «длительное».
+    return "Разовые"
+
+
+def filter_event_type(e):
+    return e.get("event_type", "Разовые")
 
 def deduplicate(events):
     unique = {}
@@ -355,16 +411,65 @@ def grouped_event_blocks(events):
     return [(f"<b>{day.strftime('%d.%m.%Y')} — {WEEKDAYS[day.weekday()]}</b>", groups[day]) for day in sorted(groups)]
 
 
-def menu():
+def get_user_filters(user_id):
+    if user_id not in USER_FILTERS:
+        USER_FILTERS[user_id] = {
+            "areas": {"Сочи", "Сириус", "Красная Поляна"},
+            "types": {"Разовые", "Постоянные"},
+        }
+    return USER_FILTERS[user_id]
+
+
+def toggle_filter(user_id, kind, value):
+    filters = get_user_filters(user_id)
+    selected = filters[kind]
+    if value in selected:
+        # Не оставляем пустой набор: если снять последнюю галочку,
+        # возвращаем все значения. Это предотвращает ситуацию «ничего не выбрано».
+        if len(selected) > 1:
+            selected.remove(value)
+        else:
+            if kind == "areas":
+                selected.update({"Сочи", "Сириус", "Красная Поляна"})
+            else:
+                selected.update({"Разовые", "Постоянные"})
+    else:
+        selected.add(value)
+
+
+def button_label(value, selected):
+    return ("✓ " if value in selected else "□ ") + value
+
+
+def menu(user_id):
+    filters = get_user_filters(user_id)
     return ReplyKeyboardMarkup(keyboard=[
         [KeyboardButton(text="Сегодня"), KeyboardButton(text="Завтра"), KeyboardButton(text="7 дней")],
-        [KeyboardButton(text="Сочи"), KeyboardButton(text="Сириус"), KeyboardButton(text="Красная Поляна")],
+        [
+            KeyboardButton(text=button_label("Сочи", filters["areas"])),
+            KeyboardButton(text=button_label("Сириус", filters["areas"])),
+            KeyboardButton(text=button_label("Красная Поляна", filters["areas"])),
+        ],
+        [
+            KeyboardButton(text=button_label("Разовые", filters["types"])),
+            KeyboardButton(text=button_label("Постоянные", filters["types"])),
+        ],
     ], resize_keyboard=True)
 
 
-async def send_events(message: Message, events, title, group_by_date=False):
+def apply_filters(user_id, events):
+    filters = get_user_filters(user_id)
+    return [
+        e for e in events
+        if e.get("area") in filters["areas"] and filter_event_type(e) in filters["types"]
+    ]
+
+
+async def send_events(message: Message, events, title, group_by_date=False, apply_user_filters=True):
+    if apply_user_filters:
+        events = apply_filters(message.from_user.id, events)
     if not events:
-        await message.answer(f"<b>{escape(title)}</b>\n\nМероприятий не найдено.", reply_markup=menu(), parse_mode="HTML")
+        await message.answer(f"<b>{escape(title)}</b>\n\nМероприятий не найдено.", reply_markup=menu(message.from_user.id), parse_mode="HTML")
         return
     events = events[:50]
     chunks, current_events, current_parts = [], [], [f"<b>{escape(title)}</b>\nНайдено: {len(events)}"]
@@ -388,22 +493,22 @@ async def send_events(message: Message, events, title, group_by_date=False):
         chunks.append((current_parts, current_events))
     for text_parts, chunk_events in chunks:
         # После ссылки "Источник" больше нет пустого технического сообщения/кнопки.
-        await message.answer("\n────────────\n\n".join(text_parts), reply_markup=menu(), parse_mode="HTML")
+        await message.answer("\n────────────\n\n".join(text_parts), reply_markup=menu(message.from_user.id), parse_mode="HTML")
 
 
 @dp.message(Command("start"))
 async def start(message: Message):
-    await message.answer(f"<b>Афиша Сочи и Сириуса</b>\n\nМероприятия из реальных источников.\nИспользуйте кнопки ниже.\n\nВерсия бота: <b>{BOT_VERSION}</b>", reply_markup=menu(), parse_mode="HTML")
+    await message.answer(f"<b>Афиша Сочи и Сириуса</b>\n\nМероприятия из реальных источников.\nИспользуйте кнопки ниже.\n\nВерсия бота: <b>{BOT_VERSION}</b>", reply_markup=menu(message.from_user.id), parse_mode="HTML")
 
 
 @dp.message(Command("version"))
 async def version_cmd(message: Message):
-    await message.answer(f"Версия бота: <b>{BOT_VERSION}</b>", parse_mode="HTML", reply_markup=menu())
+    await message.answer(f"Версия бота: <b>{BOT_VERSION}</b>", parse_mode="HTML", reply_markup=menu(message.from_user.id))
 
 
 @dp.message(Command("help"))
 async def help_cmd(message: Message):
-    await message.answer("Команды:\n/today — сегодня\n/tomorrow — завтра\n/week — ближайшие 7 дней\n\nАфиша автоматически обновляется при каждом запуске бота и затем каждые 30 минут.", reply_markup=menu())
+    await message.answer("Команды:\n/today — сегодня\n/tomorrow — завтра\n/week — ближайшие 7 дней\n\nАфиша автоматически обновляется при каждом запуске бота и затем каждые 30 минут.", reply_markup=menu(message.from_user.id))
 
 
 @dp.message(Command("today"))
@@ -427,19 +532,49 @@ async def week(message: Message):
     await send_events(message, [e for e in EVENTS if now <= e["date"] <= end], "Ближайшие 7 дней", group_by_date=True)
 
 
-@dp.message(lambda m: m.text == "Сочи")
+@dp.message(lambda m: m.text in {"Сочи", "✓ Сочи", "□ Сочи"})
 async def sochi(message: Message):
-    await send_events(message, [e for e in EVENTS if e.get("area") == "Сочи"], "Сочи")
+    toggle_filter(message.from_user.id, "areas", "Сочи")
+    filters = get_user_filters(message.from_user.id)
+    areas = ", ".join(sorted(filters["areas"], key=["Сочи", "Сириус", "Красная Поляна"].index))
+    types = ", ".join(sorted(filters["types"], key=["Разовые", "Постоянные"].index))
+    await message.answer(f"Выбраны города: {areas}\nВыбраны типы: {types}", reply_markup=menu(message.from_user.id))
 
 
-@dp.message(lambda m: m.text == "Сириус")
+@dp.message(lambda m: m.text in {"Сириус", "✓ Сириус", "□ Сириус"})
 async def sirius(message: Message):
-    await send_events(message, [e for e in EVENTS if e.get("area") == "Сириус"], "Сириус")
+    toggle_filter(message.from_user.id, "areas", "Сириус")
+    filters = get_user_filters(message.from_user.id)
+    areas = ", ".join(sorted(filters["areas"], key=["Сочи", "Сириус", "Красная Поляна"].index))
+    types = ", ".join(sorted(filters["types"], key=["Разовые", "Постоянные"].index))
+    await message.answer(f"Выбраны города: {areas}\nВыбраны типы: {types}", reply_markup=menu(message.from_user.id))
 
 
-@dp.message(lambda m: m.text == "Красная Поляна")
+@dp.message(lambda m: m.text in {"Красная Поляна", "✓ Красная Поляна", "□ Красная Поляна"})
 async def krasnaya_polyana(message: Message):
-    await send_events(message, [e for e in EVENTS if e.get("area") == "Красная Поляна"], "Красная Поляна")
+    toggle_filter(message.from_user.id, "areas", "Красная Поляна")
+    filters = get_user_filters(message.from_user.id)
+    areas = ", ".join(sorted(filters["areas"], key=["Сочи", "Сириус", "Красная Поляна"].index))
+    types = ", ".join(sorted(filters["types"], key=["Разовые", "Постоянные"].index))
+    await message.answer(f"Выбраны города: {areas}\nВыбраны типы: {types}", reply_markup=menu(message.from_user.id))
+
+
+@dp.message(lambda m: m.text in {"Разовые", "✓ Разовые", "□ Разовые"})
+async def one_time(message: Message):
+    toggle_filter(message.from_user.id, "types", "Разовые")
+    filters = get_user_filters(message.from_user.id)
+    types = ", ".join(sorted(filters["types"], key=["Разовые", "Постоянные"].index))
+    areas = ", ".join(sorted(filters["areas"], key=["Сочи", "Сириус", "Красная Поляна"].index))
+    await message.answer(f"Выбраны типы: {types}\nВыбраны города: {areas}", reply_markup=menu(message.from_user.id))
+
+
+@dp.message(lambda m: m.text in {"Постоянные", "✓ Постоянные", "□ Постоянные"})
+async def long_term(message: Message):
+    toggle_filter(message.from_user.id, "types", "Постоянные")
+    filters = get_user_filters(message.from_user.id)
+    types = ", ".join(sorted(filters["types"], key=["Разовые", "Постоянные"].index))
+    areas = ", ".join(sorted(filters["areas"], key=["Сочи", "Сириус", "Красная Поляна"].index))
+    await message.answer(f"Выбраны типы: {types}\nВыбраны города: {areas}", reply_markup=menu(message.from_user.id))
 
 
 @app.get("/")
