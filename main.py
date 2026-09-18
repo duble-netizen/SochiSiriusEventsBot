@@ -18,6 +18,7 @@ import uvicorn
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("sochi_events_bot")
 
+BOT_VERSION = "1.1.0"
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is not set")
@@ -223,7 +224,12 @@ async def send_events(message: Message, events, title, group_by_date=False):
 
 @dp.message(Command("start"))
 async def start(message: Message):
-    await message.answer("<b>Афиша Сочи и Сириуса</b>\n\nМероприятия из реальных источников.\nИспользуйте кнопки ниже.", reply_markup=menu(), parse_mode="HTML")
+    await message.answer(f"<b>Афиша Сочи и Сириуса</b>\n\nМероприятия из реальных источников.\nИспользуйте кнопки ниже.\n\nВерсия бота: <b>{BOT_VERSION}</b>", reply_markup=menu(), parse_mode="HTML")
+
+
+@dp.message(Command("version"))
+async def version_cmd(message: Message):
+    await message.answer(f"Версия бота: <b>{BOT_VERSION}</b>", parse_mode="HTML", reply_markup=menu())
 
 
 @dp.message(Command("help"))
