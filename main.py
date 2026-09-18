@@ -4,6 +4,7 @@ import logging
 import os
 import re
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from html import escape
 from urllib.parse import urljoin
 
@@ -18,7 +19,7 @@ import uvicorn
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("sochi_events_bot")
 
-BOT_VERSION = "1.6.0"
+BOT_VERSION = "2.0.0"
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is not set")
@@ -30,6 +31,9 @@ EVENTS = []
 LAST_UPDATE = None
 CALENDAR_LOG_FILE = os.getenv("CALENDAR_LOG_FILE", "calendar_added_today.json")
 CALENDAR_ADDED_LOG = []
+SUBSCRIBERS_FILE = os.getenv("SUBSCRIBERS_FILE", "subscribers.json")
+SUBSCRIBER_CHAT_IDS = set()
+MOSCOW_TZ = ZoneInfo("Europe/Moscow")
 
 # Фильтры хранятся отдельно для каждого пользователя Telegram.
 # По умолчанию выбраны все города и оба типа мероприятий.
@@ -173,6 +177,114 @@ def extract_location(container, fallback):
     return fallback
 
 
+
+def extract_image_from_jsonld(obj, page_url=""):
+    image = obj.get("image")
+    if isinstance(image, list):
+        image = image[0] if image else ""
+    if isinstance(image, dict):
+        image = image.get("url") or image.get("contentUrl") or ""
+    return urljoin(page_url, str(image)) if image else ""
+
+
+def extract_page_image(soup, page_url=""):
+    for script in soup.find_all("script", type="application/ld+json"):
+        try:
+            data = json.loads(script.string or script.get_text())
+        except Exception:
+            continue
+        objects = data if isinstance(data, list) else [data]
+        stack = list(objects)
+        while stack:
+            obj = stack.pop(0)
+            if isinstance(obj, dict):
+                if isinstance(obj.get("itemListElement"), list):
+                    stack.extend(obj["itemListElement"])
+                if obj.get("@type") in ("Event", ["Event"]):
+                    image = extract_image_from_jsonld(obj, page_url)
+                    if image:
+                        return image
+    for prop in ("og:image", "twitter:image"):
+        tag = soup.find("meta", attrs={"property": prop}) or soup.find("meta", attrs={"name": prop})
+        if tag and tag.get("content"):
+            return urljoin(page_url, tag["content"])
+    return ""
+
+
+def significance_score(event):
+    title = clean(event.get("title", "")).lower()
+    score = 0
+    if event.get("official"):
+        score += 10
+    if event.get("category") == "Спорт":
+        score += 2
+    if event.get("free"):
+        score += 1
+    for word in [
+        "фестиваль", "концерт", "премьера", "финал", "чемпионат",
+        "турнир", "симфони", "оркестр", "театр", "балет", "опера",
+        "шоу", "марафон", "кубок", "выставка",
+    ]:
+        if word in title:
+            score += 2
+    days = (event["date"].date() - datetime.now(MOSCOW_TZ).date()).days
+    if days == 0:
+        score += 8
+    elif days == 1:
+        score += 4
+    if not is_generic_location(event.get("location", ""), event.get("area", "")):
+        score += 3
+    if event.get("image_url"):
+        score += 3
+    return score
+
+
+async def send_daily_highlight():
+    if not SUBSCRIBER_CHAT_IDS or not EVENTS:
+        return
+    today = datetime.now(MOSCOW_TZ).date()
+    candidates = [e for e in EVENTS if e["date"].date() == today]
+    if not candidates:
+        now_msk = datetime.now(MOSCOW_TZ).replace(tzinfo=None)
+        candidates = [e for e in EVENTS if e["date"] >= now_msk]
+    if not candidates:
+        return
+    event = max(candidates, key=significance_score)
+    status = "✅ ПОДТВЕРЖДЕНО" if event.get("confirmed") else "⚠️ НЕ ПОДТВЕРЖДЕНО"
+    price = "Бесплатно" if event.get("free") else "Уточняйте на странице мероприятия"
+    time_text = event["date"].strftime("%d.%m.%Y, %H:%M") if event["date"].hour or event["date"].minute else event["date"].strftime("%d.%m.%Y")
+    text = (
+        f"<b>⭐ Главное событие дня</b>\n\n"
+        f"<b>{escape(event['title'])}</b>\n"
+        f"📅 {time_text}\n"
+        f"📍 {escape(display_location(event))}\n"
+        f"💰 {price}\n"
+        f"{status}\n\n"
+        f"<a href=\"{escape(event['url'], quote=True)}\">Официальная страница мероприятия</a>"
+    )
+    for chat_id in list(SUBSCRIBER_CHAT_IDS):
+        try:
+            if event.get("image_url"):
+                await bot.send_photo(chat_id, event["image_url"], caption=text, parse_mode="HTML")
+            else:
+                await bot.send_message(chat_id, text, parse_mode="HTML")
+        except Exception:
+            logger.exception("Не удалось отправить ежедневный пост chat_id=%s", chat_id)
+
+
+async def daily_highlight_loop():
+    sent_date = None
+    while True:
+        try:
+            now = datetime.now(MOSCOW_TZ)
+            if now.hour == 10 and now.minute < 2 and sent_date != now.date():
+                await send_daily_highlight()
+                sent_date = now.date()
+        except Exception:
+            logger.exception("Ошибка ежедневного поста")
+        await asyncio.sleep(30)
+
+
 def parse_sitemap_like_events(soup, source):
     """Дополнительный разбор JSON-LD ItemList/Event, который встречается на афишах."""
     found = []
@@ -204,8 +316,13 @@ def parse_sitemap_like_events(soup, source):
                                 "area": source["area"],
                                 "source": source["name"],
                                 "url": urljoin(source["url"], obj.get("url") or source["url"]),
+                                "official": source["official"],
+                                "event_page": bool(obj.get("url")),
                                 "confirmed": source["official"],
+                                "image_url": extract_image_from_jsonld(obj, source["url"]),
                                 "event_type": classify_event(title, json.dumps(obj, ensure_ascii=False)),
+                                "category": classify_category(title, json.dumps(obj, ensure_ascii=False)),
+                                "free": is_free_event(title, json.dumps(obj, ensure_ascii=False)),
                             })
     return found
 
@@ -258,11 +375,52 @@ def extract_from_source(source):
             "area": source["area"],
             "source": source["name"],
             "url": absolute,
+            "official": source["official"],
+            "event_page": absolute.rstrip("/") != source["url"].rstrip("/"),
             "confirmed": source["official"],
+            "image_url": extract_page_image(container if hasattr(container, "find_all") else soup, absolute),
             "event_type": classify_event(title, block),
+            "category": classify_category(title, block),
+            "free": is_free_event(title, block),
         })
     return found
 
+
+
+def is_free_event(title: str, source_text: str = "") -> bool:
+    """Определяет бесплатные мероприятия только по явным признакам бесплатного входа."""
+    text = clean(f"{title} {source_text}").lower()
+    # Не считаем бесплатной парковку/доставку и т.п. — нужен признак именно входа
+    free_patterns = [
+        r"\bбесплатн(?:ый|ая|ое|ые|о)\s+(?:вход|посещение|участие)\b",
+        r"\bвход\s+свободн(?:ый|а|ое)\b",
+        r"\bсвободн(?:ый|а|ое)\s+посещение\b",
+        r"\bучастие\s+бесплатн(?:ое|о)\b",
+        r"\bбесплатно\b",
+        r"\bfree\s+(?:entry|admission)\b",
+        r"\bвход\s*[:\-]?\s*0\s*(?:₽|руб(?:\.|лей)?)\b",
+        r"\bстоимость\s*[:\-]?\s*0\s*(?:₽|руб(?:\.|лей)?)\b",
+        r"\bцена\s*[:\-]?\s*0\s*(?:₽|руб(?:\.|лей)?)\b",
+    ]
+    return any(re.search(pattern, text, re.IGNORECASE) for pattern in free_patterns)
+
+
+def classify_category(title: str, source_text: str = "") -> str:
+    """Определяет тематическую категорию мероприятия. Спорт выделяется отдельно."""
+    text = clean(f"{title} {source_text}").lower()
+    sport_keywords = [
+        "спорт", "спортивн", "футбол", "хоккей", "баскетбол", "волейбол",
+        "теннис", "падел", "бадминтон", "регби", "гандбол", "фигурн",
+        "катани", "лыж", "сноуборд", "биатлон", "триатлон", "плавани",
+        "марафон", "забег", "кросс", "бег", "велогон", "велосипед",
+        "велозаезд", "автоспорт", "автогон", "мотогон", "ралли",
+        "формула-1", "формула 1", "гонка", "картинг", "бокс", "mma",
+        "единоборств", "дзюдо", "самбо", "карате", "тхэквондо",
+        "гимнастик", "легкая атлетика", "тяжелая атлетика", "шахмат",
+        "киберспорт", "турнир", "чемпионат", "первенство", "кубок",
+        "спартакиад", "соревнован", "матч", "старт", "дистанция",
+    ]
+    return "Спорт" if any(x in text for x in sport_keywords) else "Другое"
 
 
 def classify_event(title: str, source_text: str = "") -> str:
@@ -314,18 +472,28 @@ def classify_event(title: str, source_text: str = "") -> str:
 def filter_event_type(e):
     return e.get("event_type", "Разовые")
 
+def event_source_score(event):
+    return (
+        100 if event.get("official") else 0,
+        20 if event.get("event_page") else 0,
+        len(event.get("url", "")) / 10000,
+    )
+
+
+def choose_better_event(a, b):
+    return b if event_source_score(b) > event_source_score(a) else a
+
+
 def deduplicate(events):
     unique = {}
     for e in events:
-        # Не теряем события разных площадок в одном городе.
         key = (
             re.sub(r"[^a-zа-я0-9]+", "", e["title"].lower()),
             e["date"].strftime("%Y-%m-%d %H:%M"),
             e.get("area", "").lower(),
             e.get("location", "").lower(),
         )
-        if key not in unique or len(e["url"]) > len(unique[key]["url"]):
-            unique[key] = e
+        unique[key] = choose_better_event(unique[key], e) if key in unique else e
     return sorted(unique.values(), key=lambda x: x["date"])
 
 
@@ -425,6 +593,8 @@ def get_user_filters(user_id):
         USER_FILTERS[user_id] = {
             "areas": {"Сочи", "Сириус", "Красная Поляна"},
             "types": {"Разовые", "Постоянные"},
+            "categories": {"Спорт", "Другое"},
+            "free_only": False,
         }
     return USER_FILTERS[user_id]
 
@@ -520,6 +690,8 @@ def menu(user_id):
             KeyboardButton(text=button_label("Разовые", filters["types"])),
             KeyboardButton(text=button_label("Постоянные", filters["types"])),
         ],
+        [KeyboardButton(text=button_label("Спорт", filters["categories"]))],
+        [KeyboardButton(text=button_label("Бесплатно", {"Бесплатно"} if filters.get("free_only") else set()))],
     ], resize_keyboard=True)
 
 
@@ -527,7 +699,11 @@ def apply_filters(user_id, events):
     filters = get_user_filters(user_id)
     return [
         e for e in events
-        if e.get("area") in filters["areas"] and filter_event_type(e) in filters["types"]
+        if e.get("area") in filters["areas"]
+        and filter_event_type(e) in filters["types"]
+        and (set(filters.get("categories", {"Спорт", "Другое"})) == {"Спорт", "Другое"}
+             or e.get("category", "Другое") in filters.get("categories", {"Спорт", "Другое"}))
+        and (not filters.get("free_only", False) or e.get("free", False))
     ]
 
 
@@ -562,8 +738,28 @@ async def send_events(message: Message, events, title, group_by_date=False, appl
         await message.answer("\n────────────\n\n".join(text_parts), reply_markup=menu(message.from_user.id), parse_mode="HTML")
 
 
+def load_subscribers():
+    global SUBSCRIBER_CHAT_IDS
+    try:
+        if os.path.exists(SUBSCRIBERS_FILE):
+            with open(SUBSCRIBERS_FILE, "r", encoding="utf-8") as f:
+                SUBSCRIBER_CHAT_IDS = {int(x) for x in json.load(f)}
+    except Exception:
+        logger.exception("Не удалось загрузить список подписчиков")
+
+
+def save_subscribers():
+    try:
+        with open(SUBSCRIBERS_FILE, "w", encoding="utf-8") as f:
+            json.dump(sorted(SUBSCRIBER_CHAT_IDS), f)
+    except Exception:
+        logger.exception("Не удалось сохранить список подписчиков")
+
+
 @dp.message(Command("start"))
 async def start(message: Message):
+    SUBSCRIBER_CHAT_IDS.add(message.chat.id)
+    save_subscribers()
     await message.answer(f"<b>Афиша Сочи и Сириуса</b>\n\nМероприятия из реальных источников.\nИспользуйте кнопки ниже.\n\nВерсия бота: <b>{BOT_VERSION}</b>", reply_markup=menu(message.from_user.id), parse_mode="HTML")
 
 
@@ -574,7 +770,65 @@ async def version_cmd(message: Message):
 
 @dp.message(Command("help"))
 async def help_cmd(message: Message):
-    await message.answer("Команды:\n/today — сегодня\n/tomorrow — завтра\n/week — ближайшие 7 дней\n\nАфиша автоматически обновляется при каждом запуске бота и затем каждые 30 минут.", reply_markup=menu(message.from_user.id))
+    await message.answer("Команды:\n/today — сегодня\n/tomorrow — завтра\n/week — ближайшие 7 дней\n/new — что добавлено в календарь сегодня\n/источник — сайты, которые ежедневно мониторит бот\n\nАфиша автоматически обновляется при каждом запуске бота и затем каждые 30 минут.", reply_markup=menu(message.from_user.id))
+
+
+def sources_message() -> str:
+    lines = ["<b>Источники ежедневного мониторинга</b>", ""]
+    for i, source in enumerate(SOURCES, 1):
+        status = "официальный" if source.get("official") else "агрегатор"
+        lines.append(
+            f"{i}. <b>{escape(source['name'])}</b> — {status}\n"
+            f"   <a href=\"{escape(source['url'], quote=True)}\">{escape(source['url'])}</a>"
+        )
+    lines.append("")
+    lines.append(f"Всего источников: <b>{len(SOURCES)}</b>")
+    return "\n".join(lines)
+
+
+# Telegram Bot API обычно ожидает латинские команды, поэтому дополнительно
+# поддерживаем /source. При этом пользовательская команда /источник тоже работает.
+@dp.message(Command("source"))
+@dp.message(lambda m: (m.text or "").split()[0].lower() == "/источник")
+async def sources_cmd(message: Message):
+    await message.answer(
+        sources_message(),
+        reply_markup=menu(message.from_user.id),
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+    )
+
+
+@dp.message(Command("sport"))
+async def sport_command(message: Message):
+    get_user_filters(message.from_user.id)["categories"] = {"Спорт"}
+    await send_events(message, [e for e in EVENTS if e.get("category") == "Спорт"], "Спорт", apply_user_filters=False)
+
+
+@dp.message(Command("free"))
+async def free_command(message: Message):
+    get_user_filters(message.from_user.id)["free_only"] = True
+    await send_events(message, [e for e in EVENTS if e.get("free")], "Бесплатно", apply_user_filters=False)
+
+
+@dp.message(lambda m: m.text in {"Спорт", "✓ Спорт", "□ Спорт"})
+async def sport_filter(message: Message):
+    filters = get_user_filters(message.from_user.id)
+    selected = filters["categories"]
+    if selected == {"Спорт", "Другое"}:
+        filters["categories"] = {"Спорт"}
+    else:
+        filters["categories"] = {"Спорт", "Другое"}
+    category_text = "только Спорт" if filters["categories"] == {"Спорт"} else "все категории"
+    await message.answer(f"Категория: {category_text}", reply_markup=menu(message.from_user.id))
+
+
+@dp.message(lambda m: m.text in {"Бесплатно", "✓ Бесплатно", "□ Бесплатно"})
+async def free_filter(message: Message):
+    filters = get_user_filters(message.from_user.id)
+    filters["free_only"] = not filters.get("free_only", False)
+    status = "только бесплатные мероприятия" if filters["free_only"] else "все мероприятия"
+    await message.answer(f"Фильтр: {status}", reply_markup=menu(message.from_user.id))
 
 
 @dp.message(Command("new"))
@@ -701,9 +955,11 @@ async def bot_loop():
 
 async def main():
     load_calendar_added_log()
+    load_subscribers()
     await collect_events()
     collector_task = asyncio.create_task(collector_loop())
     bot_task = asyncio.create_task(bot_loop())
+    daily_highlight_task = asyncio.create_task(daily_highlight_loop())
     config = uvicorn.Config(app, host="0.0.0.0", port=int(os.getenv("PORT", "10000")), log_level="info")
     server = uvicorn.Server(config)
     web_task = asyncio.create_task(server.serve())
@@ -712,6 +968,7 @@ async def main():
     finally:
         collector_task.cancel()
         bot_task.cancel()
+        daily_highlight_task.cancel()
         web_task.cancel()
         await bot.session.close()
 
