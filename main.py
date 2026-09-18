@@ -1,15 +1,19 @@
 import os
 import asyncio
-from datetime import datetime, timedelta
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
 from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
+from fastapi import FastAPI
+import uvicorn
 
 TOKEN = os.getenv("BOT_TOKEN")
 if not TOKEN:
     raise RuntimeError("BOT_TOKEN is not set")
 
+PORT = int(os.getenv("PORT", "10000"))
+
 dp = Dispatcher()
+app = FastAPI()
 
 # Временные тестовые данные. Позже подключим автоматический сбор афиши.
 EVENTS = [
@@ -30,6 +34,7 @@ EVENTS = [
     },
 ]
 
+
 def menu():
     return ReplyKeyboardMarkup(
         keyboard=[
@@ -39,6 +44,7 @@ def menu():
         ],
         resize_keyboard=True
     )
+
 
 def format_events(events):
     if not events:
@@ -53,6 +59,17 @@ def format_events(events):
         )
     return "\n\n".join(out)
 
+
+@app.get("/")
+async def root():
+    return {"status": "ok", "service": "SochiSiriusEventsBot"}
+
+
+@app.get("/health")
+async def health():
+    return {"status": "healthy"}
+
+
 @dp.message(Command("start"))
 async def start(message: Message):
     await message.answer(
@@ -62,35 +79,42 @@ async def start(message: Message):
         reply_markup=menu()
     )
 
+
 @dp.message(Command("today"))
 @dp.message(F.text == "📅 Сегодня")
 async def today(message: Message):
     await message.answer("📅 МЕРОПРИЯТИЯ СЕГОДНЯ\n\n" + format_events(EVENTS))
+
 
 @dp.message(Command("tomorrow"))
 @dp.message(F.text == "📅 Завтра")
 async def tomorrow(message: Message):
     await message.answer("📅 МЕРОПРИЯТИЯ ЗАВТРА\n\nПока тестовых данных нет.")
 
+
 @dp.message(Command("week"))
 @dp.message(F.text == "📆 7 дней")
 async def week(message: Message):
     await message.answer("📆 БЛИЖАЙШИЕ 7 ДНЕЙ\n\n" + format_events(EVENTS))
+
 
 @dp.message(F.text == "📍 Сочи")
 async def sochi(message: Message):
     events = [e for e in EVENTS if "Сочи" in e["place"]]
     await message.answer("📍 СОЧИ\n\n" + format_events(events))
 
+
 @dp.message(F.text == "📍 Сириус")
 async def sirius(message: Message):
     events = [e for e in EVENTS if "Сириус" in e["place"]]
     await message.answer("📍 СИРИУС\n\n" + format_events(events))
 
+
 @dp.message(F.text == "⚠️ Неподтверждённые")
 async def unconfirmed(message: Message):
     events = [e for e in EVENTS if "НЕ ПОДТВЕРЖДЕНО" in e["status"]]
     await message.answer("⚠️ НЕ ПОДТВЕРЖДЁННЫЕ\n\n" + format_events(events))
+
 
 @dp.message(Command("help"))
 async def help_cmd(message: Message):
@@ -101,9 +125,20 @@ async def help_cmd(message: Message):
         "/week — ближайшие 7 дней"
     )
 
+
 async def main():
     bot = Bot(TOKEN)
-    await dp.start_polling(bot)
+    server = uvicorn.Server(
+        uvicorn.Config(app, host="0.0.0.0", port=PORT, log_level="info")
+    )
+    try:
+        await asyncio.gather(
+            dp.start_polling(bot),
+            server.serve(),
+        )
+    finally:
+        await bot.session.close()
+
 
 if __name__ == "__main__":
     asyncio.run(main())
