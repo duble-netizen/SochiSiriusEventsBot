@@ -18,7 +18,7 @@ import uvicorn
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("sochi_events_bot")
 
-BOT_VERSION = "1.4.0"
+BOT_VERSION = "1.4.1"
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is not set")
@@ -582,7 +582,7 @@ async def root():
     return {"status": "ok", "bot": "SochiSiriusEventsBot", "version": BOT_VERSION, "events": len(EVENTS), "last_update": LAST_UPDATE.isoformat() if LAST_UPDATE else None}
 
 
-@app.get("/health")
+@app.api_route("/health", methods=["GET", "HEAD"])
 async def health():
     return {"status": "ok", "version": BOT_VERSION, "events": len(EVENTS)}
 
