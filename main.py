@@ -12,13 +12,13 @@ from bs4 import BeautifulSoup
 from fastapi import FastAPI
 from aiogram import Bot, Dispatcher
 from aiogram.filters import Command
-from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
 import uvicorn
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("sochi_events_bot")
 
-BOT_VERSION = "1.1.0"
+BOT_VERSION = "1.2.0"
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is not set")
@@ -71,6 +71,59 @@ def probable_title(container, link_text: str) -> str:
     return re.sub(r"^\d+\+?\s*", "", clean(link_text))[:180]
 
 
+def location_from_jsonld(obj, fallback):
+    loc = obj.get("location")
+    if isinstance(loc, str):
+        return clean(loc) or fallback
+    if isinstance(loc, dict):
+        name = clean(loc.get("name", ""))
+        address = loc.get("address")
+        if isinstance(address, dict):
+            parts = [clean(address.get("streetAddress", "")), clean(address.get("addressLocality", ""))]
+            address_text = ", ".join(p for p in parts if p)
+            if name and address_text:
+                return f"{name}, {address_text}"
+            if name:
+                return name
+            if address_text:
+                return address_text
+        if name:
+            return name
+    return fallback
+
+
+def extract_location(container, fallback):
+    selectors = [
+        '[itemprop="location"]', '[itemprop="address"]',
+        '[class*="location"]', '[class*="venue"]', '[class*="address"]',
+        '[class*="place"]', '[id*="location"]', '[id*="venue"]',
+        '[id*="address"]', '[id*="place"]',
+    ]
+    candidates = []
+    for selector in selectors:
+        try:
+            for tag in container.select(selector):
+                text = clean(tag.get_text(" ", strip=True))
+                if 3 <= len(text) <= 250:
+                    candidates.append(text)
+        except Exception:
+            pass
+    full_text = clean(container.get_text(" ", strip=True))
+    for pattern in [
+        r"(?:площадка|место|адрес|зал)\s*[:\-]\s*([^|]{3,150})",
+        r"(?:площадка|место|адрес|зал)\s+([^|]{3,150})",
+    ]:
+        m = re.search(pattern, full_text, re.IGNORECASE)
+        if m:
+            candidates.append(clean(m.group(1)))
+    bad = {"сочи", "сириус", "подробнее", "афиша", "мероприятия", "купить билет", "билеты", "регистрация"}
+    for candidate in candidates:
+        candidate = candidate.strip(" -|,")
+        if candidate.lower() not in bad and len(candidate) >= 3:
+            return candidate
+    return fallback
+
+
 def extract_from_source(source):
     response = requests.get(source["url"], headers=HEADERS, timeout=25)
     response.raise_for_status()
@@ -97,7 +150,7 @@ def extract_from_source(source):
                 location = source["location"]
                 loc_obj = obj.get("location")
                 if isinstance(loc_obj, dict):
-                    location = clean(loc_obj.get("name") or location)
+                    location = location_from_jsonld(obj, location)
                 found.append({"title": title, "date": dt, "location": location, "source": source["name"], "url": urljoin(source["url"], obj.get("url") or source["url"]), "confirmed": source["official"]})
 
     for link in soup.find_all("a", href=True):
@@ -164,16 +217,20 @@ WEEKDAYS = ["понедельник", "вторник", "среда", "четв�
 
 
 def event_text(e, show_date=True):
-    time_str = e["date"].strftime("%H:%M") if e["date"].hour or e["date"].minute else "время не указано"
+    time_str = (
+        e["date"].strftime("%H:%M")
+        if e["date"].hour or e["date"].minute
+        else "время не указано"
+    )
     if show_date:
         info = f"{e['date'].strftime('%d.%m.%Y')}, {time_str}, {escape(e['location'])}"
     else:
         info = f"{time_str}, {escape(e['location'])}"
-    return f"<b>{escape(e['title'])}</b>\n{info}"
-
-
-def event_keyboard(events):
-    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Источник", url=e["url"])] for e in events])
+    return (
+        f"<b>{escape(e['title'])}</b>\n"
+        f"{info}\n"
+        f"<a href=\"{escape(e['url'], quote=True)}\">Источник</a>"
+    )
 
 
 def grouped_event_blocks(events):
