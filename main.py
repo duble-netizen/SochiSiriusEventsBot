@@ -326,8 +326,8 @@ async def _send_daily_highlight_once():
 # Это важно: нельзя использовать условие «после 13:30», иначе после перезапуска
 # Render бот сразу публикует пост заново.
 HIGHLIGHT_TEST_DATE = "2026-09-19"
-HIGHLIGHT_TEST_START = (13, 30)
-HIGHLIGHT_TEST_END = (13, 35)
+HIGHLIGHT_TEST_START = (14, 10)
+HIGHLIGHT_TEST_END = (14, 15)
 
 async def daily_highlight_loop():
     while True:
