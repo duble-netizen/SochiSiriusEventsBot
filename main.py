@@ -19,7 +19,7 @@ import uvicorn
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("sochi_events_bot")
 
-BOT_VERSION = "2.0.4-TEST-13:30"
+BOT_VERSION = "2.0.5-TEST-13:30"
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is not set")
@@ -350,7 +350,7 @@ def parse_sitemap_like_events(soup, source):
                                 "source": source["name"],
                                 "url": urljoin(source["url"], obj.get("url") or source["url"]),
                                 "official": source["official"],
-                                "event_page": bool(obj.get("url")),
+                                "event_page": bool(obj.get("url")) and urljoin(source["url"], obj.get("url")).rstrip("/") != source["url"].rstrip("/"),
                                 "confirmed": source["official"],
                                 "image_url": extract_image_from_jsonld(obj, source["url"]),
                                 "event_type": classify_event(title, json.dumps(obj, ensure_ascii=False)),
@@ -398,8 +398,29 @@ def extract_from_source(source):
         if not dt:
             continue
         title = probable_title(container, text)
-        if len(title) < 4 or title.lower() in ("войти", "подробнее", "все мероприятия", "культура", "спорт", "кино", "умный туризм", "главная", "афиша"):
+        title_lower = clean(title).lower()
+
+        generic_title_patterns = [
+            r"^афиша$",
+            r"^.*:\s*афиша$",
+            r"^афиша\s+.*$",
+            r"^все\s+мероприятия$",
+            r"^ближайшие\s+мероприятия$",
+            r"^расписание$",
+            r"^программа$",
+            r"^программа\s+мероприятий$",
+            r"^события$",
+        ]
+        if (
+            len(title) < 4
+            or title_lower in ("войти", "подробнее", "все мероприятия", "культура", "спорт", "кино", "умный туризм", "главная")
+            or any(re.match(pattern, title_lower) for pattern in generic_title_patterns)
+        ):
             continue
+
+        if absolute.rstrip("/") == source["url"].rstrip("/"):
+            continue
+
         location = extract_location(container, source["area"])
         found.append({
             "title": title,
@@ -517,14 +538,20 @@ def choose_better_event(a, b):
     return b if event_source_score(b) > event_source_score(a) else a
 
 
+def normalized_event_title(title):
+    text = clean(title).lower()
+    text = re.sub(r'^кз\s*[«"]?фестивальный[»"]?\s*[:—-]\s*', "", text)
+    text = re.sub(r'^фестивальный\s*[:—-]\s*', "", text)
+    return re.sub(r"[^a-zа-я0-9]+", "", text)
+
+
 def deduplicate(events):
     unique = {}
     for e in events:
         key = (
-            re.sub(r"[^a-zа-я0-9]+", "", e["title"].lower()),
+            normalized_event_title(e.get("title", "")),
             e["date"].strftime("%Y-%m-%d %H:%M"),
             e.get("area", "").lower(),
-            e.get("location", "").lower(),
         )
         unique[key] = choose_better_event(unique[key], e) if key in unique else e
     return sorted(unique.values(), key=lambda x: x["date"])
