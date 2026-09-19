@@ -19,7 +19,7 @@ import uvicorn
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("sochi_events_bot")
 
-BOT_VERSION = "2.0.0"
+BOT_VERSION = "2.0.1"
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is not set")
@@ -277,7 +277,7 @@ async def daily_highlight_loop():
     while True:
         try:
             now = datetime.now(MOSCOW_TZ)
-            if now.hour == 10 and now.minute < 2 and sent_date != now.date():
+            if now.hour == 12 and now.minute < 5 and sent_date != now.date():
                 await send_daily_highlight()
                 sent_date = now.date()
         except Exception:
