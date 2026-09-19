@@ -7,6 +7,7 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from html import escape
 from urllib.parse import urljoin
+from io import BytesIO
 from pathlib import Path
 
 import requests
@@ -14,13 +15,13 @@ from bs4 import BeautifulSoup
 from fastapi import FastAPI
 from aiogram import Bot, Dispatcher
 from aiogram.filters import Command
-from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, BufferedInputFile
 import uvicorn
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("sochi_events_bot")
 
-BOT_VERSION = "2.1.0-SELECT-15:00"
+BOT_VERSION = "2.1.2-IMAGE-FIX-15:30"
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is not set")
@@ -218,6 +219,62 @@ def extract_page_image(soup, page_url=""):
     return ""
 
 
+def resolve_event_image(event):
+    """Надёжно ищет изображение: сначала URL карточки, затем сама страница события."""
+    if event.get("image_url"):
+        return event["image_url"]
+    page_url = event.get("url", "")
+    if not page_url:
+        return ""
+    try:
+        response = requests.get(page_url, headers=HEADERS, timeout=15)
+        response.raise_for_status()
+        soup = BeautifulSoup(response.text, "html.parser")
+        image = extract_page_image(soup, page_url)
+        if image:
+            event["image_url"] = image
+            return image
+
+        # Резервный поиск обычного изображения в теле страницы.
+        for img in soup.find_all("img"):
+            for attr in ("src", "data-src", "data-lazy-src", "data-original"):
+                value = img.get(attr)
+                if value and not value.startswith("data:"):
+                    absolute = urljoin(page_url, value)
+                    if absolute.startswith(("http://", "https://")):
+                        event["image_url"] = absolute
+                        return absolute
+    except Exception:
+        logger.exception("Не удалось найти изображение страницы мероприятия: %s", page_url)
+    return ""
+
+
+def download_event_image(event):
+    """Скачивает картинку с сайта, чтобы Telegram не зависел от доступа к URL сайта."""
+    image_url = resolve_event_image(event)
+    if not image_url:
+        return None
+    try:
+        response = requests.get(image_url, headers=HEADERS, timeout=20)
+        response.raise_for_status()
+        content_type = response.headers.get("Content-Type", "")
+        data = response.content
+        if not data or (content_type and not content_type.lower().startswith("image/")):
+            return None
+        # Telegram принимает основные форматы; ограничиваем слишком большие файлы.
+        if len(data) > 9 * 1024 * 1024:
+            return None
+        ext = ".jpg"
+        if "png" in content_type.lower():
+            ext = ".png"
+        elif "webp" in content_type.lower():
+            ext = ".webp"
+        return BufferedInputFile(data, filename="event" + ext)
+    except Exception:
+        logger.exception("Не удалось скачать изображение: %s", image_url)
+        return None
+
+
 def significance_score(event):
     title = clean(event.get("title", "")).lower()
     score = 0
@@ -325,12 +382,13 @@ async def send_highlight_proposals(chat_id, candidates):
             ]])
             text = highlight_candidate_text(event, i)
             try:
-                if event.get("image_url"):
-                    await bot.send_photo(chat_id, event["image_url"], caption=text, parse_mode="HTML", reply_markup=keyboard)
+                image_file = download_event_image(event)
+                if image_file:
+                    await bot.send_photo(chat_id, image_file, caption=text, parse_mode="HTML", reply_markup=keyboard)
                 else:
                     await bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=keyboard)
             except Exception:
-                logger.exception("Не удалось отправить вариант главного события %s", i)
+                logger.exception("Не удалось отправить вариант главного события %s с изображением", i)
                 await bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=keyboard)
         return True
     finally:
@@ -355,9 +413,10 @@ async def publish_selected_highlight(event):
             f"<a href=\"{escape(event['url'], quote=True)}\">Страница мероприятия / источник</a>"
         )
         sent_any = False
+        image_file = download_event_image(event)
         try:
-            if event.get("image_url"):
-                await bot.send_photo(CHANNEL_ID, event["image_url"], caption=text, parse_mode="HTML")
+            if image_file:
+                await bot.send_photo(CHANNEL_ID, image_file, caption=text, parse_mode="HTML")
             else:
                 await bot.send_message(CHANNEL_ID, text, parse_mode="HTML")
             sent_any = True
@@ -366,8 +425,13 @@ async def publish_selected_highlight(event):
             logger.exception("Не удалось опубликовать выбранное главное событие в канале")
         for chat_id in list(SUBSCRIBER_CHAT_IDS):
             try:
-                if event.get("image_url"):
-                    await bot.send_photo(chat_id, event["image_url"], caption=text, parse_mode="HTML")
+                if image_file:
+                    # Для каждого получателя нужен отдельный BufferedInputFile.
+                    image_file_user = download_event_image(event)
+                    if image_file_user:
+                        await bot.send_photo(chat_id, image_file_user, caption=text, parse_mode="HTML")
+                    else:
+                        await bot.send_message(chat_id, text, parse_mode="HTML")
                 else:
                     await bot.send_message(chat_id, text, parse_mode="HTML")
                 sent_any = True
@@ -379,11 +443,11 @@ async def publish_selected_highlight(event):
 
 
 HIGHLIGHT_TEST_DATE = "2026-09-19"
-HIGHLIGHT_TEST_START = (15, 0)
-HIGHLIGHT_TEST_END = (15, 5)
+HIGHLIGHT_TEST_START = (15, 30)
+HIGHLIGHT_TEST_END = (15, 35)
 
 async def daily_highlight_loop():
-    """В 14:30 предлагает три варианта. Автоматической публикации без выбора нет."""
+    """В 15:30 предлагает три варианта. Автоматической публикации без выбора нет."""
     global AUTO_HIGHLIGHT_ENABLED
     while True:
         try:
@@ -396,7 +460,7 @@ async def daily_highlight_loop():
             if day.isoformat() == HIGHLIGHT_TEST_DATE:
                 in_window = HIGHLIGHT_TEST_START <= current < HIGHLIGHT_TEST_END
             else:
-                in_window = (14, 30) <= current < (14, 35)
+                in_window = (15, 30) <= current < (15, 35)
 
             if in_window and not publication_sent("highlight_proposal_v2_1", day):
                 candidates = get_highlight_candidates()
