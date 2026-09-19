@@ -20,7 +20,7 @@ import uvicorn
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("sochi_events_bot")
 
-BOT_VERSION = "2.0.9-SELECT-14:30"
+BOT_VERSION = "2.1.0-SELECT-15:00"
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is not set")
@@ -379,8 +379,8 @@ async def publish_selected_highlight(event):
 
 
 HIGHLIGHT_TEST_DATE = "2026-09-19"
-HIGHLIGHT_TEST_START = (14, 30)
-HIGHLIGHT_TEST_END = (14, 35)
+HIGHLIGHT_TEST_START = (15, 0)
+HIGHLIGHT_TEST_END = (15, 5)
 
 async def daily_highlight_loop():
     """В 14:30 предлагает три варианта. Автоматической публикации без выбора нет."""
@@ -398,13 +398,15 @@ async def daily_highlight_loop():
             else:
                 in_window = (14, 30) <= current < (14, 35)
 
-            if in_window and not publication_sent("highlight_proposal", day):
+            if in_window and not publication_sent("highlight_proposal_v2_1", day):
                 candidates = get_highlight_candidates()
                 if candidates:
                     # Предлагаем владельцу бота, а не публикуем в канал.
+                    sent = False
                     for chat_id in list(SUBSCRIBER_CHAT_IDS):
-                        await send_highlight_proposals(chat_id, candidates)
-                    mark_publication("highlight_proposal", day)
+                        sent = await send_highlight_proposals(chat_id, candidates) or sent
+                    if sent:
+                        mark_publication("highlight_proposal_v2_1", day)
                     logger.info("Три кандидата главного события предложены пользователям: %s", day)
         except Exception:
             logger.exception("Ошибка ежедневного предложения главного события")
@@ -494,6 +496,9 @@ def extract_from_source(source):
 
         generic_title_patterns = [
             r"^афиша$",
+            r"^концерт$",
+            r"^концерт\s*[•·—–-]?\s*\d{1,2}\s+(?:января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)(?:\s+\d{4})?(?:\s+в\s+\d{1,2}:\d{2})?$",
+            r"^\d{1,2}\s+(?:января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)\s+в\s+\d{1,2}:\d{2}$",
             r"^.*:\s*афиша$",
             r"^афиша\s+.*$",
             r"^все\s+мероприятия$",
@@ -634,19 +639,50 @@ def normalized_event_title(title):
     text = clean(title).lower()
     text = re.sub(r'^кз\s*[«"]?фестивальный[»"]?\s*[:—-]\s*', "", text)
     text = re.sub(r'^фестивальный\s*[:—-]\s*', "", text)
+    # Убираем служебные приставки, которые разные сайты добавляют к одному событию.
+    text = re.sub(r'^концерт\s*[•·—–:-]?\s*', "", text)
+    text = re.sub(r'^мероприятие\s*[•·—–:-]?\s*', "", text)
+    # Дата/время в заголовке карточки не является частью названия события.
+    text = re.sub(r'\b\d{1,2}\s+(?:января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)(?:\s+\d{4})?\b', ' ', text)
+    text = re.sub(r'\bв\s+\d{1,2}:\d{2}\b', ' ', text)
     return re.sub(r"[^a-zа-я0-9]+", "", text)
 
 
 def deduplicate(events):
     unique = {}
     for e in events:
-        key = (
-            normalized_event_title(e.get("title", "")),
-            e["date"].strftime("%Y-%m-%d %H:%M"),
-            e.get("area", "").lower(),
-        )
+        title_key = normalized_event_title(e.get("title", ""))
+        date_key = e["date"].strftime("%Y-%m-%d %H:%M")
+        area_key = e.get("area", "").lower()
+        key = (title_key, date_key, area_key)
         unique[key] = choose_better_event(unique[key], e) if key in unique else e
-    return sorted(unique.values(), key=lambda x: x["date"])
+
+    # Второй проход: карточки-шаблоны одного времени и площадки.
+    # Например «Концерт • 19 сентября в 17:00» не должно жить отдельно
+    # от «Концерт юных артистов балета».
+    result = []
+    for e in sorted(unique.values(), key=lambda x: x["date"]):
+        same_slot = [x for x in result if
+                     x["date"] == e["date"] and
+                     x.get("area", "").lower() == e.get("area", "").lower()]
+        if same_slot:
+            e_title = clean(e.get("title", "")).lower()
+            generic = bool(re.match(r"^концерт(?:\s*[•·—–:-]\s*)?\d{1,2}\s+(?:января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)", e_title))
+            replaced = False
+            for existing in same_slot:
+                x_title = clean(existing.get("title", "")).lower()
+                existing_generic = bool(re.match(r"^концерт(?:\s*[•·—–:-]\s*)?\d{1,2}\s+(?:января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)", x_title))
+                if generic and not existing_generic:
+                    replaced = True
+                    break
+                if existing_generic and not generic:
+                    result[result.index(existing)] = choose_better_event(existing, e)
+                    replaced = True
+                    break
+            if replaced:
+                continue
+        result.append(e)
+    return result
 
 
 def enrich_event_location(e):
