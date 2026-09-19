@@ -19,7 +19,7 @@ import uvicorn
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("sochi_events_bot")
 
-BOT_VERSION = "2.0.5-TEST-13:30"
+BOT_VERSION = "2.0.6-STOP-REPEAT"
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is not set")
@@ -306,14 +306,33 @@ async def send_daily_highlight():
     return sent_any
 
 
+# Автопубликация главного события: тест 19.09.2026 был строго ограничен
+# окном 13:30–13:35. После теста обычный режим начинается с 20.09.2026.
+# Это важно: нельзя использовать условие «после 13:30», иначе после перезапуска
+# Render бот сразу публикует пост заново.
+HIGHLIGHT_TEST_DATE = "2026-09-19"
+HIGHLIGHT_TEST_START = (13, 30)
+HIGHLIGHT_TEST_END = (13, 35)
+
 async def daily_highlight_loop():
     while True:
         try:
             now = datetime.now(MOSCOW_TZ)
             day = now.date()
-            if (now.hour > 12 or (now.hour == 12 and now.minute >= 30)) and not publication_sent("highlight", day):
+            # 19.09 — только узкое тестовое окно. Если оно уже прошло,
+            # автоматическая публикация сегодня больше не запускается.
+            if day.isoformat() == HIGHLIGHT_TEST_DATE:
+                current = (now.hour, now.minute)
+                in_test_window = HIGHLIGHT_TEST_START <= current < HIGHLIGHT_TEST_END
+            else:
+                # С 20.09 обычное ежедневное окно: 12:30–12:35.
+                current = (now.hour, now.minute)
+                in_test_window = (12, 30) <= current < (12, 35)
+
+            if in_test_window and not publication_sent("highlight", day):
                 if await send_daily_highlight():
                     mark_publication("highlight", day)
+                    logger.info("Автоматическая публикация главного события отмечена как выполненная: %s", day)
         except Exception:
             logger.exception("Ошибка ежедневного поста")
         await asyncio.sleep(30)
