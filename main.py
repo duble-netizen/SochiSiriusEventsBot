@@ -7,6 +7,7 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from html import escape
 from urllib.parse import urljoin
+from pathlib import Path
 
 import requests
 from bs4 import BeautifulSoup
@@ -19,7 +20,7 @@ import uvicorn
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("sochi_events_bot")
 
-BOT_VERSION = "2.0.6-STOP-REPEAT"
+BOT_VERSION = "2.0.7-STOP-COMMAND"
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is not set")
@@ -33,6 +34,8 @@ CALENDAR_LOG_FILE = os.getenv("CALENDAR_LOG_FILE", "calendar_added_today.json")
 CALENDAR_ADDED_LOG = []
 SUBSCRIBERS_FILE = os.getenv("SUBSCRIBERS_FILE", "subscribers.json")
 SUBSCRIBER_CHAT_IDS = set()
+HIGHLIGHT_SENDING = False
+AUTO_HIGHLIGHT_ENABLED = True
 CHANNEL_ID = os.getenv("CHANNEL_ID", "@SochiSiriusEvents")
 PUBLICATIONS_FILE = os.getenv("PUBLICATIONS_FILE", "daily_publications.json")
 MOSCOW_TZ = ZoneInfo("Europe/Moscow")
@@ -262,6 +265,18 @@ def mark_publication(kind, day):
 
 
 async def send_daily_highlight():
+    global HIGHLIGHT_SENDING
+    if HIGHLIGHT_SENDING:
+        logger.warning("Главное событие уже находится в процессе отправки — повтор пропущен")
+        return False
+    HIGHLIGHT_SENDING = True
+    try:
+        return await _send_daily_highlight_once()
+    finally:
+        HIGHLIGHT_SENDING = False
+
+
+async def _send_daily_highlight_once():
     if not EVENTS:
         logger.warning("Главное событие: список мероприятий пуст")
         return False
@@ -317,6 +332,9 @@ HIGHLIGHT_TEST_END = (13, 35)
 async def daily_highlight_loop():
     while True:
         try:
+            if not AUTO_HIGHLIGHT_ENABLED:
+                await asyncio.sleep(30)
+                continue
             now = datetime.now(MOSCOW_TZ)
             day = now.date()
             # 19.09 — только узкое тестовое окно. Если оно уже прошло,
@@ -1006,6 +1024,19 @@ async def long_term(message: Message):
     types = ", ".join(sorted(filters["types"], key=["Разовые", "Постоянные"].index))
     areas = ", ".join(sorted(filters["areas"], key=["Сочи", "Сириус", "Красная Поляна"].index))
     await message.answer(f"Выбраны типы: {types}\nВыбраны города: {areas}", reply_markup=menu(message.from_user.id))
+
+
+@dp.message(lambda m: (m.text or "").strip().lower() in {"/стоп", "/stop"})
+async def stop_highlight(message: Message):
+    global AUTO_HIGHLIGHT_ENABLED
+    AUTO_HIGHLIGHT_ENABLED = False
+    await message.answer(
+        "🛑 <b>Автопубликация главного события остановлена.</b>\n\n"
+        "Бот больше не будет автоматически публиковать главное событие.\n"
+        "Остальные функции афиши продолжают работать.",
+        parse_mode="HTML",
+        reply_markup=menu(message.from_user.id),
+    )
 
 
 @dp.message(Command("главное"))
