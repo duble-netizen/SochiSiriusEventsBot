@@ -19,7 +19,7 @@ import uvicorn
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("sochi_events_bot")
 
-BOT_VERSION = "2.0.2"
+BOT_VERSION = "2.0.4-TEST-13:30"
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is not set")
@@ -33,6 +33,8 @@ CALENDAR_LOG_FILE = os.getenv("CALENDAR_LOG_FILE", "calendar_added_today.json")
 CALENDAR_ADDED_LOG = []
 SUBSCRIBERS_FILE = os.getenv("SUBSCRIBERS_FILE", "subscribers.json")
 SUBSCRIBER_CHAT_IDS = set()
+CHANNEL_ID = os.getenv("CHANNEL_ID", "@SochiSiriusEvents")
+PUBLICATIONS_FILE = os.getenv("PUBLICATIONS_FILE", "daily_publications.json")
 MOSCOW_TZ = ZoneInfo("Europe/Moscow")
 
 # Фильтры хранятся отдельно для каждого пользователя Telegram.
@@ -239,51 +241,82 @@ def significance_score(event):
     return score
 
 
+def publication_sent(kind, day):
+    try:
+        data = json.loads(Path(PUBLICATIONS_FILE).read_text(encoding="utf-8"))
+    except Exception:
+        data = {}
+    return data.get(f"{kind}:{day.isoformat()}") is True
+
+
+def mark_publication(kind, day):
+    try:
+        try:
+            data = json.loads(Path(PUBLICATIONS_FILE).read_text(encoding="utf-8"))
+        except Exception:
+            data = {}
+        data[f"{kind}:{day.isoformat()}"] = True
+        Path(PUBLICATIONS_FILE).write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        logger.exception("Не удалось сохранить отметку публикации")
+
+
 async def send_daily_highlight():
-    if not SUBSCRIBER_CHAT_IDS or not EVENTS:
-        return
+    if not EVENTS:
+        logger.warning("Главное событие: список мероприятий пуст")
+        return False
     today = datetime.now(MOSCOW_TZ).date()
     candidates = [e for e in EVENTS if e["date"].date() == today]
     if not candidates:
         now_msk = datetime.now(MOSCOW_TZ).replace(tzinfo=None)
         candidates = [e for e in EVENTS if e["date"] >= now_msk]
     if not candidates:
-        return
+        logger.warning("Главное событие: подходящих мероприятий не найдено")
+        return False
     event = max(candidates, key=significance_score)
     status = "✅ ПОДТВЕРЖДЕНО" if event.get("confirmed") else "⚠️ НЕ ПОДТВЕРЖДЕНО"
     price = "Бесплатно" if event.get("free") else "Уточняйте на странице мероприятия"
     time_text = event["date"].strftime("%d.%m.%Y, %H:%M") if event["date"].hour or event["date"].minute else event["date"].strftime("%d.%m.%Y")
-    text = (
-        f"<b>⭐ Главное событие дня</b>\n\n"
-        f"<b>{escape(event['title'])}</b>\n"
-        f"📅 {time_text}\n"
-        f"📍 {escape(display_location(event))}\n"
-        f"💰 {price}\n"
-        f"{status}\n\n"
-        f"<a href=\"{escape(event['url'], quote=True)}\">Официальная страница мероприятия</a>"
-    )
+    text = (f"<b>⭐ Главное событие дня</b>\n\n"
+            f"<b>{escape(event['title'])}</b>\n"
+            f"📅 {time_text}\n"
+            f"📍 {escape(display_location(event))}\n"
+            f"💰 {price}\n"
+            f"{status}\n\n"
+            f"<a href=\"{escape(event['url'], quote=True)}\">Официальная страница мероприятия</a>")
+    sent_any = False
+    try:
+        if event.get("image_url"):
+            await bot.send_photo(CHANNEL_ID, event["image_url"], caption=text, parse_mode="HTML")
+        else:
+            await bot.send_message(CHANNEL_ID, text, parse_mode="HTML")
+        sent_any = True
+        logger.info("Главное событие опубликовано в канале %s", CHANNEL_ID)
+    except Exception:
+        logger.exception("Не удалось опубликовать главное событие в канале %s", CHANNEL_ID)
     for chat_id in list(SUBSCRIBER_CHAT_IDS):
         try:
             if event.get("image_url"):
                 await bot.send_photo(chat_id, event["image_url"], caption=text, parse_mode="HTML")
             else:
                 await bot.send_message(chat_id, text, parse_mode="HTML")
+            sent_any = True
         except Exception:
             logger.exception("Не удалось отправить ежедневный пост chat_id=%s", chat_id)
+    return sent_any
 
 
 async def daily_highlight_loop():
-    sent_date = None
     while True:
         try:
             now = datetime.now(MOSCOW_TZ)
-            if now.hour == 12 and 30 <= now.minute < 45 and sent_date != now.date():
-                await send_daily_highlight()
-                sent_date = now.date()
+            day = now.date()
+            if (now.hour > 12 or (now.hour == 12 and now.minute >= 30)) and not publication_sent("highlight", day):
+                if await send_daily_highlight():
+                    mark_publication("highlight", day)
         except Exception:
             logger.exception("Ошибка ежедневного поста")
         await asyncio.sleep(30)
-
 
 def parse_sitemap_like_events(soup, source):
     """Дополнительный разбор JSON-LD ItemList/Event, который встречается на афишах."""
@@ -927,6 +960,15 @@ async def long_term(message: Message):
     types = ", ".join(sorted(filters["types"], key=["Разовые", "Постоянные"].index))
     areas = ", ".join(sorted(filters["areas"], key=["Сочи", "Сириус", "Красная Поляна"].index))
     await message.answer(f"Выбраны типы: {types}\nВыбраны города: {areas}", reply_markup=menu(message.from_user.id))
+
+
+@dp.message(Command("главное"))
+async def manual_highlight(message: Message):
+    if message.chat.type == "private":
+        SUBSCRIBER_CHAT_IDS.add(message.chat.id)
+        save_subscribers()
+    ok = await send_daily_highlight()
+    await message.answer("⭐ Главное событие опубликовано в канале и отправлено подписчикам." if ok else "Не удалось найти или отправить главное событие. Проверьте логи Render.")
 
 
 @app.get("/")
