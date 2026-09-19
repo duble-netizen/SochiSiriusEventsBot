@@ -14,13 +14,13 @@ from bs4 import BeautifulSoup
 from fastapi import FastAPI
 from aiogram import Bot, Dispatcher
 from aiogram.filters import Command
-from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
+from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 import uvicorn
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("sochi_events_bot")
 
-BOT_VERSION = "2.0.7-STOP-COMMAND"
+BOT_VERSION = "2.0.9-SELECT-14:30"
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is not set")
@@ -36,6 +36,8 @@ SUBSCRIBERS_FILE = os.getenv("SUBSCRIBERS_FILE", "subscribers.json")
 SUBSCRIBER_CHAT_IDS = set()
 HIGHLIGHT_SENDING = False
 AUTO_HIGHLIGHT_ENABLED = True
+HIGHLIGHT_PROPOSALS = {}
+HIGHLIGHT_PROPOSAL_SENDING = False
 CHANNEL_ID = os.getenv("CHANNEL_ID", "@SochiSiriusEvents")
 PUBLICATIONS_FILE = os.getenv("PUBLICATIONS_FILE", "daily_publications.json")
 MOSCOW_TZ = ZoneInfo("Europe/Moscow")
@@ -264,72 +266,125 @@ def mark_publication(kind, day):
         logger.exception("Не удалось сохранить отметку публикации")
 
 
-async def send_daily_highlight():
-    global HIGHLIGHT_SENDING
-    if HIGHLIGHT_SENDING:
-        logger.warning("Главное событие уже находится в процессе отправки — повтор пропущен")
-        return False
-    HIGHLIGHT_SENDING = True
-    try:
-        return await _send_daily_highlight_once()
-    finally:
-        HIGHLIGHT_SENDING = False
-
-
-async def _send_daily_highlight_once():
+def get_highlight_candidates():
+    """Возвращает три разных сильных кандидата на главное событие."""
     if not EVENTS:
-        logger.warning("Главное событие: список мероприятий пуст")
-        return False
+        return []
     today = datetime.now(MOSCOW_TZ).date()
     candidates = [e for e in EVENTS if e["date"].date() == today]
     if not candidates:
         now_msk = datetime.now(MOSCOW_TZ).replace(tzinfo=None)
         candidates = [e for e in EVENTS if e["date"] >= now_msk]
-    if not candidates:
-        logger.warning("Главное событие: подходящих мероприятий не найдено")
-        return False
-    event = max(candidates, key=significance_score)
-    status = "✅ ПОДТВЕРЖДЕНО" if event.get("confirmed") else "⚠️ НЕ ПОДТВЕРЖДЕНО"
-    price = "Бесплатно" if event.get("free") else "Уточняйте на странице мероприятия"
+    candidates = sorted(candidates, key=significance_score, reverse=True)
+
+    result = []
+    used = set()
+    for event in candidates:
+        key = (normalized_event_title(event.get("title", "")), event["date"].strftime("%Y-%m-%d %H:%M"))
+        if key in used:
+            continue
+        # Не предлагаем несколько почти одинаковых записей одного и того же события.
+        if any(normalized_event_title(x.get("title", "")) == normalized_event_title(event.get("title", "")) for x in result):
+            continue
+        result.append(event)
+        used.add(key)
+        if len(result) == 3:
+            break
+    return result
+
+
+def highlight_candidate_text(event, number):
     time_text = event["date"].strftime("%d.%m.%Y, %H:%M") if event["date"].hour or event["date"].minute else event["date"].strftime("%d.%m.%Y")
-    text = (f"<b>⭐ Главное событие дня</b>\n\n"
+    price = "Бесплатно" if event.get("free") else "Уточняйте на странице мероприятия"
+    return (
+        f"<b>⭐ Вариант {number}</b>\n\n"
+        f"<b>{escape(event['title'])}</b>\n"
+        f"📅 {time_text}\n"
+        f"📍 {escape(display_location(event))}\n"
+        f"💰 {price}\n\n"
+        f"<a href=\"{escape(event['url'], quote=True)}\">Страница мероприятия / источник</a>"
+    )
+
+
+async def send_highlight_proposals(chat_id, candidates):
+    """Показывает пользователю три кандидата и ждёт его выбора."""
+    global HIGHLIGHT_PROPOSAL_SENDING
+    if HIGHLIGHT_PROPOSAL_SENDING:
+        return False
+    HIGHLIGHT_PROPOSAL_SENDING = True
+    try:
+        HIGHLIGHT_PROPOSALS[chat_id] = candidates
+        await bot.send_message(
+            chat_id,
+            "<b>⭐ Выбери главное событие дня</b>\n\nЯ отобрал 3 наиболее значимых варианта. Ничего не публикую, пока ты не выберешь один.",
+            parse_mode="HTML",
+        )
+        for i, event in enumerate(candidates, 1):
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text=f"Выбрать вариант {i}", callback_data=f"highlight_select:{i-1}")
+            ]])
+            text = highlight_candidate_text(event, i)
+            try:
+                if event.get("image_url"):
+                    await bot.send_photo(chat_id, event["image_url"], caption=text, parse_mode="HTML", reply_markup=keyboard)
+                else:
+                    await bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=keyboard)
+            except Exception:
+                logger.exception("Не удалось отправить вариант главного события %s", i)
+                await bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=keyboard)
+        return True
+    finally:
+        HIGHLIGHT_PROPOSAL_SENDING = False
+
+
+async def publish_selected_highlight(event):
+    """Публикует выбранное пользователем мероприятие в канал и подписчикам."""
+    global HIGHLIGHT_SENDING
+    if HIGHLIGHT_SENDING:
+        return False
+    HIGHLIGHT_SENDING = True
+    try:
+        time_text = event["date"].strftime("%d.%m.%Y, %H:%M") if event["date"].hour or event["date"].minute else event["date"].strftime("%d.%m.%Y")
+        price = "Бесплатно" if event.get("free") else "Уточняйте на странице мероприятия"
+        text = (
+            f"<b>⭐ Главное событие дня</b>\n\n"
             f"<b>{escape(event['title'])}</b>\n"
             f"📅 {time_text}\n"
             f"📍 {escape(display_location(event))}\n"
-            f"💰 {price}\n"
-            f"{status}\n\n"
-            f"<a href=\"{escape(event['url'], quote=True)}\">Официальная страница мероприятия</a>")
-    sent_any = False
-    try:
-        if event.get("image_url"):
-            await bot.send_photo(CHANNEL_ID, event["image_url"], caption=text, parse_mode="HTML")
-        else:
-            await bot.send_message(CHANNEL_ID, text, parse_mode="HTML")
-        sent_any = True
-        logger.info("Главное событие опубликовано в канале %s", CHANNEL_ID)
-    except Exception:
-        logger.exception("Не удалось опубликовать главное событие в канале %s", CHANNEL_ID)
-    for chat_id in list(SUBSCRIBER_CHAT_IDS):
+            f"💰 {price}\n\n"
+            f"<a href=\"{escape(event['url'], quote=True)}\">Страница мероприятия / источник</a>"
+        )
+        sent_any = False
         try:
             if event.get("image_url"):
-                await bot.send_photo(chat_id, event["image_url"], caption=text, parse_mode="HTML")
+                await bot.send_photo(CHANNEL_ID, event["image_url"], caption=text, parse_mode="HTML")
             else:
-                await bot.send_message(chat_id, text, parse_mode="HTML")
+                await bot.send_message(CHANNEL_ID, text, parse_mode="HTML")
             sent_any = True
+            logger.info("Выбранное главное событие опубликовано в канале %s", CHANNEL_ID)
         except Exception:
-            logger.exception("Не удалось отправить ежедневный пост chat_id=%s", chat_id)
-    return sent_any
+            logger.exception("Не удалось опубликовать выбранное главное событие в канале")
+        for chat_id in list(SUBSCRIBER_CHAT_IDS):
+            try:
+                if event.get("image_url"):
+                    await bot.send_photo(chat_id, event["image_url"], caption=text, parse_mode="HTML")
+                else:
+                    await bot.send_message(chat_id, text, parse_mode="HTML")
+                sent_any = True
+            except Exception:
+                logger.exception("Не удалось отправить выбранное главное событие chat_id=%s", chat_id)
+        return sent_any
+    finally:
+        HIGHLIGHT_SENDING = False
 
 
-# Автопубликация главного события: тест 19.09.2026 был строго ограничен
-# окном 13:30–13:35. После теста обычный режим начинается с 20.09.2026.
-# Это важно: нельзя использовать условие «после 13:30», иначе после перезапуска
-# Render бот сразу публикует пост заново.
 HIGHLIGHT_TEST_DATE = "2026-09-19"
-HIGHLIGHT_TEST_START = (14, 10)
-HIGHLIGHT_TEST_END = (14, 15)
+HIGHLIGHT_TEST_START = (14, 30)
+HIGHLIGHT_TEST_END = (14, 35)
 
 async def daily_highlight_loop():
+    """В 14:30 предлагает три варианта. Автоматической публикации без выбора нет."""
+    global AUTO_HIGHLIGHT_ENABLED
     while True:
         try:
             if not AUTO_HIGHLIGHT_ENABLED:
@@ -337,22 +392,22 @@ async def daily_highlight_loop():
                 continue
             now = datetime.now(MOSCOW_TZ)
             day = now.date()
-            # 19.09 — только узкое тестовое окно. Если оно уже прошло,
-            # автоматическая публикация сегодня больше не запускается.
+            current = (now.hour, now.minute)
             if day.isoformat() == HIGHLIGHT_TEST_DATE:
-                current = (now.hour, now.minute)
-                in_test_window = HIGHLIGHT_TEST_START <= current < HIGHLIGHT_TEST_END
+                in_window = HIGHLIGHT_TEST_START <= current < HIGHLIGHT_TEST_END
             else:
-                # С 20.09 обычное ежедневное окно: 12:30–12:35.
-                current = (now.hour, now.minute)
-                in_test_window = (12, 30) <= current < (12, 35)
+                in_window = (14, 30) <= current < (14, 35)
 
-            if in_test_window and not publication_sent("highlight", day):
-                if await send_daily_highlight():
-                    mark_publication("highlight", day)
-                    logger.info("Автоматическая публикация главного события отмечена как выполненная: %s", day)
+            if in_window and not publication_sent("highlight_proposal", day):
+                candidates = get_highlight_candidates()
+                if candidates:
+                    # Предлагаем владельцу бота, а не публикуем в канал.
+                    for chat_id in list(SUBSCRIBER_CHAT_IDS):
+                        await send_highlight_proposals(chat_id, candidates)
+                    mark_publication("highlight_proposal", day)
+                    logger.info("Три кандидата главного события предложены пользователям: %s", day)
         except Exception:
-            logger.exception("Ошибка ежедневного поста")
+            logger.exception("Ошибка ежедневного предложения главного события")
         await asyncio.sleep(30)
 
 def parse_sitemap_like_events(soup, source):
@@ -1030,13 +1085,37 @@ async def long_term(message: Message):
 async def stop_highlight(message: Message):
     global AUTO_HIGHLIGHT_ENABLED
     AUTO_HIGHLIGHT_ENABLED = False
+    HIGHLIGHT_PROPOSALS.pop(message.chat.id, None)
     await message.answer(
-        "🛑 <b>Автопубликация главного события остановлена.</b>\n\n"
-        "Бот больше не будет автоматически публиковать главное событие.\n"
-        "Остальные функции афиши продолжают работать.",
+        "🛑 <b>Автоматическое предложение главного события остановлено.</b>\n\n"
+        "Бот больше не будет сам предлагать 3 варианта главного события. Остальные функции афиши продолжают работать.",
         parse_mode="HTML",
         reply_markup=menu(message.from_user.id),
     )
+
+
+@dp.callback_query(lambda c: c.data and c.data.startswith("highlight_select:"))
+async def highlight_select(callback: CallbackQuery):
+    chat_id = callback.message.chat.id if callback.message else callback.from_user.id
+    candidates = HIGHLIGHT_PROPOSALS.get(chat_id, [])
+    try:
+        index = int(callback.data.split(":", 1)[1])
+    except Exception:
+        index = -1
+    if index < 0 or index >= len(candidates):
+        await callback.answer("Этот список вариантов уже неактуален.", show_alert=True)
+        return
+    event = candidates[index]
+    await callback.answer("Выбрано")
+    ok = await publish_selected_highlight(event)
+    if ok:
+        HIGHLIGHT_PROPOSALS.pop(chat_id, None)
+        await callback.message.answer(
+            f"✅ Опубликовано: <b>{escape(event['title'])}</b>",
+            parse_mode="HTML",
+        )
+    else:
+        await callback.message.answer("Не удалось опубликовать выбранное мероприятие. Проверьте логи Render.")
 
 
 @dp.message(Command("главное"))
@@ -1044,8 +1123,11 @@ async def manual_highlight(message: Message):
     if message.chat.type == "private":
         SUBSCRIBER_CHAT_IDS.add(message.chat.id)
         save_subscribers()
-    ok = await send_daily_highlight()
-    await message.answer("⭐ Главное событие опубликовано в канале и отправлено подписчикам." if ok else "Не удалось найти или отправить главное событие. Проверьте логи Render.")
+    candidates = get_highlight_candidates()
+    if not candidates:
+        await message.answer("Не удалось найти кандидатов на главное событие.")
+        return
+    await send_highlight_proposals(message.chat.id, candidates)
 
 
 @app.get("/")
