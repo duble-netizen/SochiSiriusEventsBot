@@ -1,1256 +1,888 @@
 import asyncio
+import html
 import json
 import logging
 import os
 import re
-from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
-from html import escape
-from urllib.parse import urljoin
-from io import BytesIO
+from datetime import datetime, timedelta, date, time
 from pathlib import Path
+from urllib.parse import urljoin
 
 import requests
-from bs4 import BeautifulSoup
 from fastapi import FastAPI
 from aiogram import Bot, Dispatcher
 from aiogram.filters import Command
-from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, BufferedInputFile
+from aiogram.types import (
+    Message, ReplyKeyboardMarkup, KeyboardButton,
+    InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery,
+    BufferedInputFile,
+)
+from zoneinfo import ZoneInfo
 import uvicorn
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("sochi_events_bot")
 
-BOT_VERSION = "2.2.2-SELECT-12:00"
+BOT_VERSION = "3.0.0-OUTLOOK-ICS"
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+OUTLOOK_ICS_URL = os.getenv("OUTLOOK_ICS_URL")
+CHANNEL_ID = os.getenv("CHANNEL_ID", "@SochiSiriusEvents")
+MOSCOW_TZ = ZoneInfo("Europe/Moscow")
+
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is not set")
+if not OUTLOOK_ICS_URL:
+    raise RuntimeError("OUTLOOK_ICS_URL is not set")
 
 app = FastAPI()
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
+
 EVENTS = []
 LAST_UPDATE = None
-CALENDAR_LOG_FILE = os.getenv("CALENDAR_LOG_FILE", "calendar_added_today.json")
-CALENDAR_ADDED_LOG = []
 SUBSCRIBERS_FILE = os.getenv("SUBSCRIBERS_FILE", "subscribers.json")
-SUBSCRIBER_CHAT_IDS = set()
+PUBLICATIONS_FILE = os.getenv("PUBLICATIONS_FILE", "daily_publications.json")
+SUBSCRIBERS = set()
+HIGHLIGHT_PROPOSALS = {}
 HIGHLIGHT_SENDING = False
 AUTO_HIGHLIGHT_ENABLED = True
-HIGHLIGHT_PROPOSALS = {}
-HIGHLIGHT_PROPOSAL_SENDING = False
-CHANNEL_ID = os.getenv("CHANNEL_ID", "@SochiSiriusEvents")
-PUBLICATIONS_FILE = os.getenv("PUBLICATIONS_FILE", "daily_publications.json")
-MOSCOW_TZ = ZoneInfo("Europe/Moscow")
+HEADERS = {"User-Agent": "SochiSiriusEventsBot/3.0"}
 
-# Фильтры хранятся отдельно для каждого пользователя Telegram.
-# По умолчанию выбраны все города и оба типа мероприятий.
-USER_FILTERS = {}
+AREA_ORDER = ["Сочи", "Сириус", "Красная Поляна"]
+TYPE_ORDER = ["Разовые", "Постоянные"]
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/140.0 Safari/537.36"
+GENERIC_WORDS = {
+    "афиша", "программа", "расписание", "мероприятия",
+    "все мероприятия", "ближайшие мероприятия",
 }
 
-# Чем больше официальных площадок, тем шире охват. Ссылки проверены 18.09.2026.
-SOURCES = [
-    {"name": "Бюро культуры Сочи", "url": "https://sochi.burocultura.ru/events", "area": "Сочи", "official": True},
-    {"name": "Официальная афиша Сириуса", "url": "https://www.sirius.gov.ru/afisha/", "area": "Сириус", "official": True},
-    {"name": "Концертный центр «Сириус»", "url": "https://concert.sirius.ru/", "area": "Сириус", "official": True},
-    {"name": "Художественно-исторический центр «Сириус»", "url": "https://art.sirius.ru/poster/", "area": "Сириус", "official": True},
-    {"name": "Сириус Автодром", "url": "https://siriusautodrom.ru/fest2026", "area": "Сириус", "official": True},
-    {"name": "Курорт Красная Поляна", "url": "https://krasnayapolyanaresort.ru/events", "area": "Красная Поляна", "official": True},
-    {"name": "Сочи Парк", "url": "https://www.sochipark.ru/programma/", "area": "Сочи", "official": True},
-    {"name": "КЗ «Фестивальный»", "url": "https://www.festivalniy.com/", "area": "Сочи", "official": True},
-    {"name": "КЗ «Фестивальный» — афиша ДК Сочи", "url": "https://www.dksochi.ru/playbill/festivalnii", "area": "Сочи", "official": True},
-    {"name": "Зимний театр — афиша ДК Сочи", "url": "https://www.dksochi.ru/playbill/zimnii-teatr", "area": "Сочи", "official": True},
-    {"name": "Зимний театр — Яндекс Афиша", "url": "https://afisha.yandex.ru/sochi/theatre/places/zimnii-teatr/schedule", "area": "Сочи", "official": False},
-    {"name": "Афиша Фестивального — Яндекс Афиша", "url": "https://afisha.yandex.ru/sochi/concert/places/festivalnyi/schedule", "area": "Сочи", "official": False},
-    {"name": "Афиша Сочи — локальный агрегатор", "url": "https://afisha-sochi.com/", "area": "Сочи", "official": False},
-    {"name": "ИНТЦ «Сириус»", "url": "https://intc.sirius.ru/", "area": "Сириус", "official": True},
-]
+SERVICE_WORDS = (
+    "экскурси", "посещение", "прогулка", "прокат", "аренда",
+    "трансфер", "услуга", "билет", "тур", "мастер-класс",
+)
+PERMANENT_WORDS = (
+    "каждый день", "ежедневно", "еженедельно", "регулярно",
+    "постоянно", "экскурси", "посещение", "программа дня",
+)
+
+WINDOW_TZ_MAP = {
+    "Russian Standard Time": "Europe/Moscow",
+    "Russia Time Zone 3": "Europe/Moscow",
+    "W. Europe Standard Time": "Europe/Berlin",
+    "Russian Standard Time 2": "Europe/Moscow",
+    "Europe/Moscow": "Europe/Moscow",
+    "Europe/Berlin": "Europe/Berlin",
+}
+
+MONTHS_RU = {
+    "января": 1, "февраля": 2, "марта": 3, "апреля": 4,
+    "мая": 5, "июня": 6, "июля": 7, "августа": 8,
+    "сентября": 9, "октября": 10, "ноября": 11, "декабря": 12,
+}
 
 
-def clean(text: str) -> str:
-    return re.sub(r"\s+", " ", text or "").strip()
+def clean(value):
+    return re.sub(r"\s+", " ", str(value or "")).strip()
 
 
-MONTHS = {"января": 1, "февраля": 2, "марта": 3, "апреля": 4, "мая": 5, "июня": 6, "июля": 7, "августа": 8, "сентября": 9, "октября": 10, "ноября": 11, "декабря": 12}
+def ics_unescape(value):
+    value = str(value or "")
+    value = value.replace("\\n", "\n").replace("\\N", "\n")
+    value = value.replace("\\,", ",").replace("\\;", ";").replace("\\\\", "\\")
+    return clean(value)
 
 
-def parse_date_time(text: str):
-    text = clean(text).lower()
-    year = datetime.now().year
-    m = re.search(r"\b(\d{1,2})\s+(января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)(?:\s+(\d{4}))?(?:[^\d]{0,15})(\d{1,2}):(\d{2})", text)
-    if m:
-        return datetime(int(m.group(3)) if m.group(3) else year, MONTHS[m.group(2)], int(m.group(1)), int(m.group(4)), int(m.group(5)))
-    m = re.search(r"\b(\d{1,2})\s+(января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)(?:\s+(\d{4}))?", text)
-    if m:
-        return datetime(int(m.group(3)) if m.group(3) else year, MONTHS[m.group(2)], int(m.group(1)))
-    m = re.search(r"\b(\d{1,2})[./](\d{1,2})(?:[./](\d{4}))?(?:[^\d]{0,10})(\d{1,2})[.:](\d{2})", text)
-    if m:
-        return datetime(int(m.group(3)) if m.group(3) else year, int(m.group(2)), int(m.group(1)), int(m.group(4)), int(m.group(5)))
-    m = re.search(r"\b(\d{1,2})[./](\d{1,2})[./](\d{4})\b", text)
-    if m:
-        return datetime(int(m.group(3)), int(m.group(2)), int(m.group(1)))
-    return None
+def unfold_ics(text):
+    lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    result = []
+    for line in lines:
+        if line.startswith((" ", "\t")) and result:
+            result[-1] += line[1:]
+        else:
+            result.append(line)
+    return result
 
 
-def probable_title(container, link_text: str) -> str:
-    for tag in container.find_all(["h1", "h2", "h3", "h4", "h5", "strong"], limit=8):
-        t = clean(tag.get_text(" ", strip=True))
-        if len(t) >= 4 and not re.match(r"^\d", t):
-            return t
-    return re.sub(r"^\d+\+?\s*", "", clean(link_text))[:180]
+def parse_ics_property(line):
+    if ":" not in line:
+        return "", {}, ""
+    left, value = line.split(":", 1)
+    bits = left.split(";")
+    name = bits[0].upper()
+    params = {}
+    for bit in bits[1:]:
+        if "=" in bit:
+            k, v = bit.split("=", 1)
+            params[k.upper()] = v.strip('"')
+    return name, params, value
 
 
-def location_from_jsonld(obj, fallback):
-    loc = obj.get("location")
-    if isinstance(loc, list):
-        loc = loc[0] if loc else None
-    if isinstance(loc, str):
-        value = clean(loc)
-        return value or fallback
-    if isinstance(loc, dict):
-        name = clean(loc.get("name", ""))
-        address = loc.get("address")
-        if isinstance(address, dict):
-            parts = [clean(address.get("streetAddress", "")), clean(address.get("addressLocality", ""))]
-            address_text = ", ".join(p for p in parts if p)
-            if name and address_text:
-                return f"{name}, {address_text}"
-            if name:
-                return name
-            if address_text:
-                return address_text
-        if name:
-            return name
-    return fallback
-
-
-def is_generic_location(value, area):
-    v = clean(value).lower()
-    a = clean(area).lower()
-    generic = {"сочи", "сириус", "красная поляна", "адлер", "эсто-садок", "сочи, россия", "сириус, россия"}
-    return v in generic or v == a or v.startswith(a + ",") and len(v) <= len(a) + 10
-
-
-def extract_location(container, fallback):
-    selectors = [
-        '[itemprop="location"]', '[itemprop="address"]',
-        '[class*="location"]', '[class*="venue"]', '[class*="address"]',
-        '[class*="place"]', '[id*="location"]', '[id*="venue"]',
-        '[id*="address"]', '[id*="place"]',
-    ]
-    candidates = []
-    for selector in selectors:
-        try:
-            for tag in container.select(selector):
-                text = clean(tag.get_text(" ", strip=True))
-                if 3 <= len(text) <= 250:
-                    candidates.append(text)
-        except Exception:
-            pass
-
-    full_text = clean(container.get_text(" ", strip=True))
-    # На многих современных афишах подпись склеивается с названием:
-    # "МестоКазино...", "Время21:00".
-    patterns = [
-        r"(?:место|площадка|адрес|зал)\s*[:\-]?\s*([^|]{3,180}?)(?=\s+(?:время|дата|стоимость|купить|подробнее)\b|$)",
-        r"(?:место|площадка|адрес|зал)\s*[:\-]?\s*([^•·]{3,180}?)(?=\s*[•·]|$)",
-    ]
-    for pattern in patterns:
-        for m in re.finditer(pattern, full_text, re.IGNORECASE):
-            candidates.append(clean(m.group(1)))
-
-    # Частый вариант у JSON/HTML: Venue: ...
-    for label in ["venue", "location", "place"]:
-        for tag in container.find_all(attrs={"data-" + label: True}):
-            value = clean(tag.get("data-" + label, ""))
-            if value:
-                candidates.append(value)
-
-    bad = {
-        "сочи", "сириус", "красная поляна", "подробнее", "афиша", "мероприятия",
-        "купить билет", "билеты", "регистрация", "время", "дата"
-    }
-    for candidate in candidates:
-        candidate = clean(candidate.strip(" -|,.:"))
-        low = candidate.lower()
-        if low in bad or len(candidate) < 3:
-            continue
-        # Отбрасываем куски, в которых попался только служебный текст.
-        if low.startswith(("время", "дата", "стоимость", "купить")):
-            continue
-        return candidate
-    return fallback
-
-
-
-def extract_image_from_jsonld(obj, page_url=""):
-    image = obj.get("image")
-    if isinstance(image, list):
-        image = image[0] if image else ""
-    if isinstance(image, dict):
-        image = image.get("url") or image.get("contentUrl") or ""
-    return urljoin(page_url, str(image)) if image else ""
-
-
-def extract_page_image(soup, page_url=""):
-    for script in soup.find_all("script", type="application/ld+json"):
-        try:
-            data = json.loads(script.string or script.get_text())
-        except Exception:
-            continue
-        objects = data if isinstance(data, list) else [data]
-        stack = list(objects)
-        while stack:
-            obj = stack.pop(0)
-            if isinstance(obj, dict):
-                if isinstance(obj.get("itemListElement"), list):
-                    stack.extend(obj["itemListElement"])
-                if obj.get("@type") in ("Event", ["Event"]):
-                    image = extract_image_from_jsonld(obj, page_url)
-                    if image:
-                        return image
-    for prop in ("og:image", "twitter:image"):
-        tag = soup.find("meta", attrs={"property": prop}) or soup.find("meta", attrs={"name": prop})
-        if tag and tag.get("content"):
-            return urljoin(page_url, tag["content"])
-    return ""
-
-
-def resolve_event_image(event):
-    """Надёжно ищет изображение: сначала URL карточки, затем сама страница события."""
-    if event.get("image_url"):
-        return event["image_url"]
-    page_url = event.get("url", "")
-    if not page_url:
-        return ""
-    try:
-        response = requests.get(page_url, headers=HEADERS, timeout=15)
-        response.raise_for_status()
-        soup = BeautifulSoup(response.text, "html.parser")
-        image = extract_page_image(soup, page_url)
-        if image:
-            event["image_url"] = image
-            return image
-
-        # Резервный поиск обычного изображения в теле страницы.
-        for img in soup.find_all("img"):
-            for attr in ("src", "data-src", "data-lazy-src", "data-original"):
-                value = img.get(attr)
-                if value and not value.startswith("data:"):
-                    absolute = urljoin(page_url, value)
-                    if absolute.startswith(("http://", "https://")):
-                        event["image_url"] = absolute
-                        return absolute
-    except Exception:
-        logger.exception("Не удалось найти изображение страницы мероприятия: %s", page_url)
-    return ""
-
-
-def download_event_image(event):
-    """Скачивает картинку с сайта, чтобы Telegram не зависел от доступа к URL сайта."""
-    image_url = resolve_event_image(event)
-    if not image_url:
-        return None
-    try:
-        response = requests.get(image_url, headers=HEADERS, timeout=20)
-        response.raise_for_status()
-        content_type = response.headers.get("Content-Type", "")
-        data = response.content
-        if not data or (content_type and not content_type.lower().startswith("image/")):
-            return None
-        # Telegram принимает основные форматы; ограничиваем слишком большие файлы.
-        if len(data) > 9 * 1024 * 1024:
-            return None
-        ext = ".jpg"
-        if "png" in content_type.lower():
-            ext = ".png"
-        elif "webp" in content_type.lower():
-            ext = ".webp"
-        return BufferedInputFile(data, filename="event" + ext)
-    except Exception:
-        logger.exception("Не удалось скачать изображение: %s", image_url)
+def parse_ics_datetime(value, params=None):
+    params = params or {}
+    value = value.strip()
+    if not value:
         return None
 
+    if len(value) == 8 and value.isdigit():
+        try:
+            return datetime.strptime(value, "%Y%m%d").replace(tzinfo=MOSCOW_TZ)
+        except ValueError:
+            return None
 
-def significance_score(event):
-    title = clean(event.get("title", "")).lower()
-    score = 0
-    if event.get("official"):
-        score += 10
-    if event.get("category") == "Спорт":
-        score += 2
-    if event.get("free"):
-        score += 1
-    for word in [
-        "фестиваль", "концерт", "премьера", "финал", "чемпионат",
-        "турнир", "симфони", "оркестр", "театр", "балет", "опера",
-        "шоу", "марафон", "кубок", "выставка",
-    ]:
-        if word in title:
-            score += 2
-    days = (event["date"].date() - datetime.now(MOSCOW_TZ).date()).days
-    if days == 0:
-        score += 8
-    elif days == 1:
-        score += 4
-    if not is_generic_location(event.get("location", ""), event.get("area", "")):
-        score += 3
-    if event.get("image_url"):
-        score += 3
-    return score
+    is_utc = value.endswith("Z")
+    raw = value[:-1] if is_utc else value
+    fmt = "%Y%m%dT%H%M%S" if len(raw) >= 15 else "%Y%m%dT%H%M"
+    try:
+        dt = datetime.strptime(raw, fmt)
+    except ValueError:
+        return None
+
+    if is_utc:
+        return dt.replace(tzinfo=ZoneInfo("UTC")).astimezone(MOSCOW_TZ)
+
+    tz_name = params.get("TZID", "")
+    tz_name = WINDOW_TZ_MAP.get(tz_name, tz_name)
+    try:
+        tz = ZoneInfo(tz_name) if tz_name else MOSCOW_TZ
+    except Exception:
+        tz = MOSCOW_TZ
+    return dt.replace(tzinfo=tz).astimezone(MOSCOW_TZ)
+
+
+def parse_rrule(value):
+    result = {}
+    for part in str(value or "").split(";"):
+        if "=" in part:
+            k, v = part.split("=", 1)
+            result[k.upper()] = v
+    return result
+
+
+def expand_event(base, now):
+    """Expand common Outlook RRULE forms for the next 90 days."""
+    rule = base.get("rrule")
+    if not rule:
+        return [base]
+
+    out = []
+    start = base["date"]
+    until = rule.get("UNTIL")
+    until_dt = parse_ics_datetime(until) if until else now + timedelta(days=90)
+    until_dt = min(until_dt or now + timedelta(days=90), now + timedelta(days=90))
+    count = int(rule.get("COUNT", "1000") or 1000)
+    freq = rule.get("FREQ", "").upper()
+    interval = max(1, int(rule.get("INTERVAL", "1") or 1))
+    byday = [x for x in rule.get("BYDAY", "").split(",") if x]
+
+    cur = start
+    generated = 0
+    while cur <= until_dt and generated < count and len(out) < 300:
+        if cur >= now - timedelta(days=1):
+            if freq == "WEEKLY" and byday:
+                weekday_map = {"MO": 0, "TU": 1, "WE": 2, "TH": 3, "FR": 4, "SA": 5, "SU": 6}
+                target_days = {weekday_map.get(x[-2:]) for x in byday}
+                if cur.weekday() in target_days:
+                    out.append(dict(base, date=cur))
+                    generated += 1
+            else:
+                out.append(dict(base, date=cur))
+                generated += 1
+
+        if freq == "DAILY":
+            cur += timedelta(days=interval)
+        elif freq == "WEEKLY":
+            cur += timedelta(days=interval if not byday else 1)
+        elif freq == "MONTHLY":
+            month = cur.month - 1 + interval
+            year = cur.year + month // 12
+            month = month % 12 + 1
+            day = min(cur.day, [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][month - 1])
+            cur = cur.replace(year=year, month=month, day=day)
+        else:
+            return [base]
+    return out or [base]
+
+
+def extract_urls(text):
+    return re.findall(r"https?://[^\s<>\]\)\"']+", str(text or ""))
+
+
+def infer_area(text):
+    low = clean(text).lower()
+    if any(x in low for x in ("сириус", "федеральная территория", "университет сириус", "олимпийский парк", "автодром сириус")):
+        return "Сириус"
+    if any(x in low for x in ("красная поляна", "эсто-садок", "розa хутор", "роза хутор", "газпром", "горки город", "горный кластер")):
+        return "Красная Поляна"
+    return "Сочи"
+
+
+def is_cancelled(event):
+    return str(event.get("status", "")).upper() == "CANCELLED" or "отмен" in clean(event.get("description", "")).lower()
+
+
+def is_generic_title(title):
+    low = clean(title).lower()
+    if low in GENERIC_WORDS:
+        return True
+    return any(low.startswith(x + ":") or low == x for x in GENERIC_WORDS)
+
+
+def event_type(title, description=""):
+    text = f"{title} {description}".lower()
+    if any(x in text for x in PERMANENT_WORDS):
+        return "Постоянные"
+    return "Разовые"
+
+
+def category_for(title, description=""):
+    text = f"{title} {description}".lower()
+    if any(x in text for x in ("спорт", "матч", "турнир", "чемпионат", "марафон", "заплыв", "гонка", "футбол", "хоккей", "теннис", "бокс")):
+        return "Спорт"
+    if any(x in text for x in ("выставк", "экспозиц")):
+        return "Выставка"
+    if any(x in text for x in ("лекци", "форум", "конференци", "встреча", "семинар")):
+        return "Лекция"
+    if any(x in text for x in ("детск", "семейн", "ребен", "аниматор")):
+        return "Детское"
+    if any(x in text for x in ("театр", "спектакл", "балет", "опера", "постановк")):
+        return "Театр"
+    if any(x in text for x in ("концерт", "музык", "оркестр", "симфони", "певец", "певиц")):
+        return "Концерт"
+    if any(x in text for x in ("фестивал", "праздник", "ярмарк")):
+        return "Фестиваль"
+    return "Другое"
+
+
+def parse_ics_events(text):
+    lines = unfold_ics(text)
+    raw_events = []
+    current = None
+    in_event = False
+
+    for line in lines:
+        if line.upper() == "BEGIN:VEVENT":
+            current = {}
+            in_event = True
+            continue
+        if line.upper() == "END:VEVENT":
+            if current:
+                raw_events.append(current)
+            current = None
+            in_event = False
+            continue
+        if not in_event:
+            continue
+
+        name, params, value = parse_ics_property(line)
+        if not name:
+            continue
+        value = ics_unescape(value)
+
+        if name in {"DTSTART", "DTEND"}:
+            current[name] = (value, params)
+        elif name == "ATTACH":
+            current.setdefault("attachments", []).append((value, params))
+        else:
+            current[name] = value
+
+    now = datetime.now(MOSCOW_TZ)
+    result = []
+
+    for raw in raw_events:
+        start = parse_ics_datetime(*(raw.get("DTSTART", ("", {}))))
+        if not start:
+            continue
+        title = clean(raw.get("SUMMARY", "Без названия"))
+        if not title or is_generic_title(title):
+            continue
+
+        desc = clean(raw.get("DESCRIPTION", ""))
+        location = clean(raw.get("LOCATION", ""))
+        url = clean(raw.get("URL", ""))
+
+        urls = extract_urls(desc)
+        if not url and urls:
+            url = urls[0]
+
+        image_url = ""
+        for attachment, params in raw.get("attachments", []):
+            if "image" in params.get("FMTTYPE", "").lower() or re.search(r"\.(jpg|jpeg|png|webp)(?:\?|$)", attachment, re.I):
+                image_url = attachment
+                break
+
+        base = {
+            "uid": clean(raw.get("UID", "")),
+            "title": title,
+            "date": start,
+            "end": parse_ics_datetime(*(raw.get("DTEND", ("", {})))) if raw.get("DTEND") else None,
+            "location": location,
+            "description": desc,
+            "url": url,
+            "image_url": image_url,
+            "status": clean(raw.get("STATUS", "")),
+            "rrule": parse_rrule(raw.get("RRULE", "")) if raw.get("RRULE") else None,
+        }
+
+        if base["rrule"]:
+            occurrences = expand_event(base, now)
+        else:
+            occurrences = [base]
+
+        for event in occurrences:
+            combined = f"{event['title']} {event['location']} {event['description']}"
+            event["area"] = infer_area(combined)
+            event["type"] = event_type(event["title"], event["description"])
+            event["category"] = category_for(event["title"], event["description"])
+            event["free"] = bool(re.search(r"\bбесплатн\w*|\b0\s*(?:₽|руб)", combined, re.I))
+            event["official"] = True
+            event["cancelled"] = is_cancelled(event)
+            result.append(event)
+
+    # Deduplicate occurrences from duplicate calendar entries.
+    unique = {}
+    for event in result:
+        key = (
+            event.get("uid") or "",
+            event["date"].astimezone(MOSCOW_TZ).strftime("%Y-%m-%d %H:%M"),
+            re.sub(r"\W+", "", event["title"].lower(), flags=re.UNICODE),
+        )
+        if key in unique:
+            # Keep the richer record.
+            old = unique[key]
+            if len(event.get("description", "")) > len(old.get("description", "")):
+                unique[key] = event
+        else:
+            unique[key] = event
+
+    return sorted(unique.values(), key=lambda x: x["date"])
+
+
+def load_calendar():
+    response = requests.get(OUTLOOK_ICS_URL, headers=HEADERS, timeout=30)
+    response.raise_for_status()
+    content = response.content.decode("utf-8-sig", errors="replace")
+    return parse_ics_events(content)
+
+
+async def collect_events():
+    global EVENTS, LAST_UPDATE
+    try:
+        events = await asyncio.to_thread(load_calendar)
+        EVENTS = events
+        LAST_UPDATE = datetime.now(MOSCOW_TZ)
+        logger.info("Outlook ICS: найдено %s событий", len(EVENTS))
+    except Exception:
+        logger.exception("Не удалось загрузить Outlook ICS")
+
+
+def display_location(event):
+    return event.get("location") or event.get("area") or "Место не указано"
+
+
+def normalized_title(title):
+    return re.sub(r"[^a-zа-яё0-9]+", "", clean(title).lower(), flags=re.I)
+
+
+def event_text(event, include_status=True):
+    dt = event["date"].astimezone(MOSCOW_TZ)
+    line = f"📅 {dt.strftime('%d.%m.%Y')} {dt.strftime('%H:%M')}\n"
+    location = display_location(event)
+    text = f"<b>{html.escape(event['title'])}</b>\n{line}📍 {html.escape(location)}"
+    if event.get("category"):
+        text += f"\n🏷 {html.escape(event['category'])}"
+    if include_status and event.get("cancelled"):
+        text += "\n❌ ОТМЕНЕНО"
+    if event.get("url"):
+        text += f'\n🔗 <a href="{html.escape(event["url"], quote=True)}">Источник / страница события</a>'
+    return text
+
+
+def filter_event_list(events, user_id=None):
+    if user_id is None:
+        return events
+    f = get_filters(user_id)
+    return [
+        e for e in events
+        if e["area"] in f["areas"]
+        and e["type"] in f["types"]
+        and (not f["sports_only"] or e["category"] == "Спорт")
+        and (not f["free_only"] or e["free"])
+    ]
+
+
+def get_filters(user_id):
+    if user_id not in FILTERS:
+        FILTERS[user_id] = {
+            "areas": set(AREA_ORDER),
+            "types": set(TYPE_ORDER),
+            "sports_only": False,
+            "free_only": False,
+        }
+    return FILTERS[user_id]
+
+
+FILTERS = {}
+
+
+def menu(user_id):
+    f = get_filters(user_id)
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="Сегодня"), KeyboardButton(text="Завтра"), KeyboardButton(text="7 дней")],
+            [KeyboardButton(text=("✓ " if "Сочи" in f["areas"] else "□ ") + "Сочи"),
+             KeyboardButton(text=("✓ " if "Сириус" in f["areas"] else "□ ") + "Сириус"),
+             KeyboardButton(text=("✓ " if "Красная Поляна" in f["areas"] else "□ ") + "Красная Поляна")],
+            [KeyboardButton(text=("✓ " if "Разовые" in f["types"] else "□ ") + "Разовые"),
+             KeyboardButton(text=("✓ " if "Постоянные" in f["types"] else "□ ") + "Постоянные")],
+            [KeyboardButton(text=("✓ " if f["sports_only"] else "□ ") + "Спорт"),
+             KeyboardButton(text=("✓ " if f["free_only"] else "□ ") + "Бесплатно")],
+        ],
+        resize_keyboard=True,
+    )
+
+
+def get_events_for_day(day):
+    return [e for e in EVENTS if e["date"].astimezone(MOSCOW_TZ).date() == day and not e.get("cancelled")]
+
+
+async def send_event_list(message, events, title):
+    events = filter_event_list(events, message.from_user.id)
+    events = sorted(events, key=lambda e: e["date"])[:60]
+    if not events:
+        await message.answer(f"<b>{html.escape(title)}</b>\n\nМероприятий не найдено.", parse_mode="HTML", reply_markup=menu(message.from_user.id))
+        return
+
+    chunks = []
+    current = f"<b>{html.escape(title)}</b>\nНайдено: {len(events)}\n\n"
+    for event in events:
+        block = event_text(event)
+        if len(current) + len(block) + 10 > 3800:
+            chunks.append(current)
+            current = ""
+        current += block + "\n\n────────────\n\n"
+    if current:
+        chunks.append(current)
+
+    for chunk in chunks:
+        await message.answer(chunk, parse_mode="HTML", reply_markup=menu(message.from_user.id), disable_web_page_preview=True)
+
+
+def load_json(path, default):
+    try:
+        return json.loads(Path(path).read_text(encoding="utf-8"))
+    except Exception:
+        return default
+
+
+def save_json(path, data):
+    try:
+        Path(path).write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        logger.exception("Не удалось сохранить %s", path)
+
+
+def load_subscribers():
+    global SUBSCRIBERS
+    SUBSCRIBERS = {int(x) for x in load_json(SUBSCRIBERS_FILE, []) if str(x).lstrip("-").isdigit()}
+
+
+def save_subscribers():
+    save_json(SUBSCRIBERS_FILE, sorted(SUBSCRIBERS))
 
 
 def publication_sent(kind, day):
-    try:
-        data = json.loads(Path(PUBLICATIONS_FILE).read_text(encoding="utf-8"))
-    except Exception:
-        data = {}
+    data = load_json(PUBLICATIONS_FILE, {})
     return data.get(f"{kind}:{day.isoformat()}") is True
 
 
 def mark_publication(kind, day):
-    try:
-        try:
-            data = json.loads(Path(PUBLICATIONS_FILE).read_text(encoding="utf-8"))
-        except Exception:
-            data = {}
-        data[f"{kind}:{day.isoformat()}"] = True
-        Path(PUBLICATIONS_FILE).write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    except Exception:
-        logger.exception("Не удалось сохранить отметку публикации")
+    data = load_json(PUBLICATIONS_FILE, {})
+    data[f"{kind}:{day.isoformat()}"] = True
+    save_json(PUBLICATIONS_FILE, data)
 
 
-def get_highlight_candidates():
-    """Возвращает три разных сильных кандидата на главное событие."""
-    if not EVENTS:
-        return []
+def significance_score(event):
+    title = clean(event["title"]).lower()
+    score = 0
+    if event["cancelled"]:
+        return -10000
+    if event["type"] == "Постоянные":
+        score -= 30
+    if any(w in title for w in SERVICE_WORDS):
+        score -= 20
+    for word, points in {
+        "фестиваль": 18, "концерт": 16, "премьера": 18, "финал": 18,
+        "чемпионат": 17, "турнир": 14, "спектакль": 15, "театр": 13,
+        "балет": 14, "опера": 14, "шоу": 14, "марафон": 14,
+        "кубок": 13, "выставка": 11, "открытие": 13, "праздник": 12,
+        "оркестр": 12, "симфони": 12,
+    }.items():
+        if word in title:
+            score += points
+    if event["category"] == "Спорт":
+        score += 5
+    if event["area"] == "Сириус":
+        score += 2
+    if event["free"]:
+        score += 1
+    if event.get("image_url"):
+        score += 2
     today = datetime.now(MOSCOW_TZ).date()
-    candidates = [e for e in EVENTS if e["date"].date() == today]
-    if not candidates:
-        now_msk = datetime.now(MOSCOW_TZ).replace(tzinfo=None)
-        candidates = [e for e in EVENTS if e["date"] >= now_msk]
-    candidates = sorted(candidates, key=significance_score, reverse=True)
+    delta = (event["date"].astimezone(MOSCOW_TZ).date() - today).days
+    if delta == 0:
+        score += 15
+        if event["date"].astimezone(MOSCOW_TZ) < datetime.now(MOSCOW_TZ):
+            score -= 20
+    elif delta == 1:
+        score += 6
+    return score
+
+
+def highlight_candidates():
+    today = datetime.now(MOSCOW_TZ).date()
+    pool = [
+        e for e in EVENTS
+        if e["date"].astimezone(MOSCOW_TZ).date() == today
+        and not e["cancelled"]
+        and e["date"] > datetime.now(MOSCOW_TZ)
+        and e["type"] == "Разовые"
+        and not any(w in clean(e["title"]).lower() for w in SERVICE_WORDS)
+    ]
+    pool.sort(key=significance_score, reverse=True)
 
     result = []
-    used = set()
-    for event in candidates:
-        key = (normalized_event_title(event.get("title", "")), event["date"].strftime("%Y-%m-%d %H:%M"))
-        if key in used:
+    seen = set()
+    for e in pool:
+        key = normalized_title(e["title"])
+        if key in seen:
             continue
-        # Не предлагаем несколько почти одинаковых записей одного и того же события.
-        if any(normalized_event_title(x.get("title", "")) == normalized_event_title(event.get("title", "")) for x in result):
-            continue
-        result.append(event)
-        used.add(key)
+        result.append(e)
+        seen.add(key)
         if len(result) == 3:
             break
     return result
 
 
-def highlight_candidate_text(event, number):
-    time_text = event["date"].strftime("%d.%m.%Y, %H:%M") if event["date"].hour or event["date"].minute else event["date"].strftime("%d.%m.%Y")
-    price = "Бесплатно" if event.get("free") else "Уточняйте на странице мероприятия"
-    return (
+def proposal_text(event, number):
+    dt = event["date"].astimezone(MOSCOW_TZ)
+    text = (
         f"<b>⭐ Вариант {number}</b>\n\n"
-        f"<b>{escape(event['title'])}</b>\n"
-        f"📅 {time_text}\n"
-        f"📍 {escape(display_location(event))}\n"
-        f"💰 {price}\n\n"
-        f"<a href=\"{escape(event['url'], quote=True)}\">Страница мероприятия / источник</a>"
+        f"<b>{html.escape(event['title'])}</b>\n"
+        f"📅 {dt.strftime('%d.%m.%Y, %H:%M')}\n"
+        f"📍 {html.escape(display_location(event))}\n"
     )
+    if event.get("url"):
+        text += f'\n🔗 <a href="{html.escape(event["url"], quote=True)}">Официальная страница / источник</a>'
+    return text
 
 
-async def send_highlight_proposals(chat_id, candidates):
-    """Показывает пользователю три кандидата и ждёт его выбора."""
-    global HIGHLIGHT_PROPOSAL_SENDING
-    if HIGHLIGHT_PROPOSAL_SENDING:
-        return False
-    HIGHLIGHT_PROPOSAL_SENDING = True
+def fetch_image_sync(event):
+    if event.get("image_url"):
+        url = event["image_url"]
+    elif event.get("url"):
+        try:
+            from bs4 import BeautifulSoup
+            r = requests.get(event["url"], headers=HEADERS, timeout=15)
+            r.raise_for_status()
+            soup = BeautifulSoup(r.text, "html.parser")
+            tag = soup.find("meta", attrs={"property": "og:image"}) or soup.find("meta", attrs={"name": "twitter:image"})
+            url = urljoin(event["url"], tag.get("content")) if tag and tag.get("content") else ""
+        except Exception:
+            url = ""
+    else:
+        url = ""
+    if not url:
+        return None
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=20)
+        r.raise_for_status()
+        content_type = r.headers.get("Content-Type", "")
+        if not content_type.startswith("image/") or len(r.content) > 9 * 1024 * 1024:
+            return None
+        ext = ".jpg"
+        if "png" in content_type:
+            ext = ".png"
+        elif "webp" in content_type:
+            ext = ".webp"
+        return BufferedInputFile(r.content, filename="poster" + ext)
+    except Exception:
+        return None
+
+
+async def send_highlight_proposals(chat_id):
+    global HIGHLIGHT_SENDING
+    if HIGHLIGHT_SENDING:
+        return
+    candidates = highlight_candidates()
+    if not candidates:
+        await bot.send_message(chat_id, "На сегодня не нашёл подходящих кандидатов на главное событие.")
+        return
+    HIGHLIGHT_SENDING = True
     try:
         HIGHLIGHT_PROPOSALS[chat_id] = candidates
         await bot.send_message(
             chat_id,
-            "<b>⭐ Выбери главное событие дня</b>\n\nЯ отобрал 3 наиболее значимых варианта. Ничего не публикую, пока ты не выберешь один.",
+            "<b>⭐ Главное событие дня</b>\n\nВыбери один из 3 вариантов. Публикация произойдёт только после твоего выбора.",
             parse_mode="HTML",
         )
-        for i, event in enumerate(candidates, 1):
-            keyboard = InlineKeyboardMarkup(inline_keyboard=[[
-                InlineKeyboardButton(text=f"Выбрать вариант {i}", callback_data=f"highlight_select:{i-1}")
+        for i, event in enumerate(candidates):
+            kb = InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text=f"Выбрать вариант {i+1}", callback_data=f"highlight:{i}")
             ]])
-            text = highlight_candidate_text(event, i)
-            try:
-                image_file = download_event_image(event)
-                if image_file:
-                    await bot.send_photo(chat_id, image_file, caption=text, parse_mode="HTML", reply_markup=keyboard)
-                else:
-                    await bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=keyboard)
-            except Exception:
-                logger.exception("Не удалось отправить вариант главного события %s с изображением", i)
-                await bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=keyboard)
-        return True
-    finally:
-        HIGHLIGHT_PROPOSAL_SENDING = False
-
-
-async def publish_selected_highlight(event):
-    """Публикует выбранное пользователем мероприятие в канал и подписчикам."""
-    global HIGHLIGHT_SENDING
-    if HIGHLIGHT_SENDING:
-        return False
-    HIGHLIGHT_SENDING = True
-    try:
-        time_text = event["date"].strftime("%d.%m.%Y, %H:%M") if event["date"].hour or event["date"].minute else event["date"].strftime("%d.%m.%Y")
-        price = "Бесплатно" if event.get("free") else "Уточняйте на странице мероприятия"
-        text = (
-            f"<b>⭐ Главное событие дня</b>\n\n"
-            f"<b>{escape(event['title'])}</b>\n"
-            f"📅 {time_text}\n"
-            f"📍 {escape(display_location(event))}\n"
-            f"💰 {price}\n\n"
-            f"<a href=\"{escape(event['url'], quote=True)}\">Страница мероприятия / источник</a>"
-        )
-        sent_any = False
-        image_file = download_event_image(event)
-        try:
-            if image_file:
-                await bot.send_photo(CHANNEL_ID, image_file, caption=text, parse_mode="HTML")
+            text = proposal_text(event, i + 1)
+            image = await asyncio.to_thread(fetch_image_sync, event)
+            if image:
+                await bot.send_photo(chat_id, image, caption=text, parse_mode="HTML", reply_markup=kb)
             else:
-                await bot.send_message(CHANNEL_ID, text, parse_mode="HTML")
-            sent_any = True
-            logger.info("Выбранное главное событие опубликовано в канале %s", CHANNEL_ID)
-        except Exception:
-            logger.exception("Не удалось опубликовать выбранное главное событие в канале")
-        for chat_id in list(SUBSCRIBER_CHAT_IDS):
-            try:
-                if image_file:
-                    # Для каждого получателя нужен отдельный BufferedInputFile.
-                    image_file_user = download_event_image(event)
-                    if image_file_user:
-                        await bot.send_photo(chat_id, image_file_user, caption=text, parse_mode="HTML")
-                    else:
-                        await bot.send_message(chat_id, text, parse_mode="HTML")
-                else:
-                    await bot.send_message(chat_id, text, parse_mode="HTML")
-                sent_any = True
-            except Exception:
-                logger.exception("Не удалось отправить выбранное главное событие chat_id=%s", chat_id)
-        return sent_any
+                await bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=kb)
     finally:
         HIGHLIGHT_SENDING = False
 
 
-DAILY_PROGRAM_START = (11, 0)
-DAILY_PROGRAM_END = (11, 30)
-
-
-async def publish_daily_program():
-    """Публикует в Telegram-канал полную программу мероприятий на сегодня."""
-    day = datetime.now(MOSCOW_TZ).date()
-    events = sorted([e for e in EVENTS if e.get("date") and e["date"].date() == day], key=lambda e: e["date"])
-    if not events:
-        await bot.send_message(
-            CHANNEL_ID,
-            f"<b>Афиша на сегодня — {day.strftime('%d.%m.%Y')}</b>\n\nАктуальных мероприятий не найдено.",
-            parse_mode="HTML",
-        )
-        return True
-    await bot.send_message(
-        CHANNEL_ID,
-        f"<b>📅 Афиша на сегодня — {day.strftime('%d.%m.%Y')}</b>\nНайдено мероприятий: <b>{len(events)}</b>\nСочи • Сириус • Красная Поляна",
-        parse_mode="HTML",
+async def publish_highlight(event):
+    dt = event["date"].astimezone(MOSCOW_TZ)
+    text = (
+        f"<b>⭐ Главное событие сегодня</b>\n\n"
+        f"<b>{html.escape(event['title'])}</b>\n"
+        f"📅 {dt.strftime('%d.%m.%Y, %H:%M')}\n"
+        f"📍 {html.escape(display_location(event))}\n"
     )
-    sent = 0
-    for event in events:
-        text = event_text(event, show_date=False)
-        try:
-            image_file = download_event_image(event)
-            if image_file:
-                await bot.send_photo(CHANNEL_ID, image_file, caption=text, parse_mode="HTML")
-            else:
-                await bot.send_message(CHANNEL_ID, text, parse_mode="HTML")
-            sent += 1
-        except Exception:
-            logger.exception("Не удалось опубликовать мероприятие: %s", event.get("title", ""))
+    if event.get("url"):
+        text += f'\n🔗 <a href="{html.escape(event["url"], quote=True)}">Страница события</a>'
+
+    image = await asyncio.to_thread(fetch_image_sync, event)
+    try:
+        if image:
+            await bot.send_photo(CHANNEL_ID, image, caption=text, parse_mode="HTML")
+        else:
+            await bot.send_message(CHANNEL_ID, text, parse_mode="HTML", disable_web_page_preview=False)
+        return True
+    except Exception:
+        logger.exception("Ошибка публикации главного события")
+        return False
+
+
+def daily_summary_text():
+    day = datetime.now(MOSCOW_TZ).date()
+    events = get_events_for_day(day)
+    events.sort(key=lambda e: e["date"])
+    lines = [f"<b>📅 Афиша на сегодня — {day.strftime('%d.%m.%Y')}</b>", ""]
+    if not events:
+        return "\n".join(lines + ["Мероприятий в календаре не найдено."])
+    for e in events[:70]:
+        dt = e["date"].astimezone(MOSCOW_TZ)
+        lines.append(
+            f"• <b>{dt.strftime('%H:%M')}</b> — {html.escape(e['title'])} "
+            f"({html.escape(display_location(e))})"
+        )
+        if e.get("url"):
+            lines.append(f'  🔗 <a href="{html.escape(e["url"], quote=True)}">Источник</a>')
+    return "\n".join(lines)
+
+
+async def publish_daily_summary():
+    day = datetime.now(MOSCOW_TZ).date()
+    if publication_sent("daily", day):
+        return
+    try:
+        await bot.send_message(CHANNEL_ID, daily_summary_text(), parse_mode="HTML", disable_web_page_preview=True)
+        for chat_id in list(SUBSCRIBERS):
             try:
-                await bot.send_message(CHANNEL_ID, text, parse_mode="HTML")
-                sent += 1
+                await bot.send_message(chat_id, daily_summary_text(), parse_mode="HTML", disable_web_page_preview=True)
             except Exception:
-                logger.exception("Повторная отправка не удалась: %s", event.get("title", ""))
-    return sent > 0
+                logger.exception("Не удалось отправить дневную программу %s", chat_id)
+        mark_publication("daily", day)
+        logger.info("Ежедневная программа опубликована")
+    except Exception:
+        logger.exception("Не удалось опубликовать ежедневную программу")
 
 
-async def daily_program_loop():
-    """Ежедневно публикует программу в окне 11:00–11:30 по Москве."""
+async def daily_schedule_loop():
+    sent_day = None
     while True:
-        try:
-            now = datetime.now(MOSCOW_TZ)
-            day = now.date()
-            current = (now.hour, now.minute)
-            if DAILY_PROGRAM_START <= current < DAILY_PROGRAM_END and not publication_sent("daily_program_v2_2", day):
-                if await publish_daily_program():
-                    mark_publication("daily_program_v2_2", day)
-        except Exception:
-            logger.exception("Ошибка ежедневной публикации программы")
+        now = datetime.now(MOSCOW_TZ)
+        # Окно 11:00–11:30, фактическая отправка в 11:05.
+        if now.hour == 11 and 5 <= now.minute <= 30 and sent_day != now.date():
+            await publish_daily_summary()
+            sent_day = now.date()
         await asyncio.sleep(30)
 
-
-HIGHLIGHT_TEST_DATE = "2026-09-20"
-HIGHLIGHT_TEST_START = (12, 0)
-HIGHLIGHT_TEST_END = (12, 15)
 
 async def daily_highlight_loop():
-    """В 15:30 предлагает три варианта. Автоматической публикации без выбора нет."""
-    global AUTO_HIGHLIGHT_ENABLED
+    sent_day = None
     while True:
-        try:
-            if not AUTO_HIGHLIGHT_ENABLED:
-                await asyncio.sleep(30)
-                continue
-            now = datetime.now(MOSCOW_TZ)
-            day = now.date()
-            current = (now.hour, now.minute)
-            if day.isoformat() == HIGHLIGHT_TEST_DATE:
-                in_window = HIGHLIGHT_TEST_START <= current < HIGHLIGHT_TEST_END
-            else:
-                in_window = (12, 0) <= current < (12, 15)
-
-            if in_window and not publication_sent("highlight_proposal_v2_1", day):
-                candidates = get_highlight_candidates()
-                if candidates:
-                    # Предлагаем владельцу бота, а не публикуем в канал.
-                    sent = False
-                    for chat_id in list(SUBSCRIBER_CHAT_IDS):
-                        sent = await send_highlight_proposals(chat_id, candidates) or sent
-                    if sent:
-                        mark_publication("highlight_proposal_v2_1", day)
-                    logger.info("Три кандидата главного события предложены пользователям: %s", day)
-        except Exception:
-            logger.exception("Ошибка ежедневного предложения главного события")
+        now = datetime.now(MOSCOW_TZ)
+        # Окно 12:00–12:15, предложение трёх кандидатов.
+        if AUTO_HIGHLIGHT_ENABLED and now.hour == 12 and 0 <= now.minute <= 15 and sent_day != now.date():
+            candidates = highlight_candidates()
+            if candidates:
+                # Предложение получает владелец/первый подписчик.
+                targets = list(SUBSCRIBERS)
+                if targets:
+                    await send_highlight_proposals(targets[0])
+                sent_day = now.date()
         await asyncio.sleep(30)
-
-def parse_sitemap_like_events(soup, source):
-    """Дополнительный разбор JSON-LD ItemList/Event, который встречается на афишах."""
-    found = []
-    for script in soup.find_all("script", type="application/ld+json"):
-        try:
-            data = json.loads(script.string or script.get_text())
-        except Exception:
-            continue
-        objects = data if isinstance(data, list) else [data]
-        stack = list(objects)
-        while stack:
-            obj = stack.pop(0)
-            if isinstance(obj, dict):
-                if isinstance(obj.get("itemListElement"), list):
-                    stack.extend(obj["itemListElement"])
-                if obj.get("@type") in ("Event", ["Event"]):
-                    title, start = clean(obj.get("name", "")), obj.get("startDate")
-                    if title and start:
-                        try:
-                            dt = datetime.fromisoformat(str(start).replace("Z", "+00:00")).replace(tzinfo=None)
-                        except Exception:
-                            dt = parse_date_time(str(start))
-                        if dt:
-                            location = location_from_jsonld(obj, source["area"])
-                            found.append({
-                                "title": title,
-                                "date": dt,
-                                "location": location,
-                                "area": source["area"],
-                                "source": source["name"],
-                                "url": urljoin(source["url"], obj.get("url") or source["url"]),
-                                "official": source["official"],
-                                "event_page": bool(obj.get("url")) and urljoin(source["url"], obj.get("url")).rstrip("/") != source["url"].rstrip("/"),
-                                "confirmed": source["official"],
-                                "image_url": extract_image_from_jsonld(obj, source["url"]),
-                                "event_type": classify_event(title, json.dumps(obj, ensure_ascii=False)),
-                                "category": classify_category(title, json.dumps(obj, ensure_ascii=False)),
-                                "free": is_free_event(title, json.dumps(obj, ensure_ascii=False)),
-                            })
-    return found
-
-
-def extract_from_source(source):
-    response = requests.get(source["url"], headers=HEADERS, timeout=25)
-    response.raise_for_status()
-    soup = BeautifulSoup(response.text, "html.parser")
-    found = parse_sitemap_like_events(soup, source)
-
-    for link in soup.find_all("a", href=True):
-        href, absolute, text = link.get("href", ""), urljoin(source["url"], link.get("href", "")), clean(link.get_text(" ", strip=True))
-        if len(text) < 4 or absolute.rstrip("/") == source["url"].rstrip("/"):
-            continue
-        allowed = (
-            "/events" in absolute or "/event/" in absolute or "/afisha" in absolute
-            or "programma" in absolute or source["name"] in ("Официальная афиша Сириуса", "Роза Хутор")
-        )
-        if not allowed:
-            continue
-        container = link
-        for _ in range(6):
-            if container.parent and len(clean(container.parent.get_text(" ", strip=True))) < 3000:
-                container = container.parent
-            else:
-                break
-        block = clean(container.get_text(" ", strip=True))
-        dt = parse_date_time(block)
-        if not dt:
-            parent = container.parent
-            for _ in range(3):
-                if not parent:
-                    break
-                dt = parse_date_time(parent.get_text(" ", strip=True))
-                if dt:
-                    container = parent
-                    block = clean(container.get_text(" ", strip=True))
-                    break
-                parent = parent.parent
-        if not dt:
-            continue
-        title = probable_title(container, text)
-        title_lower = clean(title).lower()
-
-        generic_title_patterns = [
-            r"^афиша$",
-            r"^концерт$",
-            r"^концерт\s*[•·—–-]?\s*\d{1,2}\s+(?:января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)(?:\s+\d{4})?(?:\s+в\s+\d{1,2}:\d{2})?$",
-            r"^\d{1,2}\s+(?:января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)\s+в\s+\d{1,2}:\d{2}$",
-            r"^.*:\s*афиша$",
-            r"^афиша\s+.*$",
-            r"^все\s+мероприятия$",
-            r"^ближайшие\s+мероприятия$",
-            r"^расписание$",
-            r"^программа$",
-            r"^программа\s+мероприятий$",
-            r"^события$",
-        ]
-        if (
-            len(title) < 4
-            or title_lower in ("войти", "подробнее", "все мероприятия", "культура", "спорт", "кино", "умный туризм", "главная")
-            or any(re.match(pattern, title_lower) for pattern in generic_title_patterns)
-        ):
-            continue
-
-        if absolute.rstrip("/") == source["url"].rstrip("/"):
-            continue
-
-        location = extract_location(container, source["area"])
-        found.append({
-            "title": title,
-            "date": dt,
-            "location": location,
-            "area": source["area"],
-            "source": source["name"],
-            "url": absolute,
-            "official": source["official"],
-            "event_page": absolute.rstrip("/") != source["url"].rstrip("/"),
-            "confirmed": source["official"],
-            "image_url": extract_page_image(container if hasattr(container, "find_all") else soup, absolute),
-            "event_type": classify_event(title, block),
-            "category": classify_category(title, block),
-            "free": is_free_event(title, block),
-        })
-    return found
-
-
-
-def is_free_event(title: str, source_text: str = "") -> bool:
-    """Определяет бесплатные мероприятия только по явным признакам бесплатного входа."""
-    text = clean(f"{title} {source_text}").lower()
-    # Не считаем бесплатной парковку/доставку и т.п. — нужен признак именно входа
-    free_patterns = [
-        r"\bбесплатн(?:ый|ая|ое|ые|о)\s+(?:вход|посещение|участие)\b",
-        r"\bвход\s+свободн(?:ый|а|ое)\b",
-        r"\bсвободн(?:ый|а|ое)\s+посещение\b",
-        r"\bучастие\s+бесплатн(?:ое|о)\b",
-        r"\bбесплатно\b",
-        r"\bfree\s+(?:entry|admission)\b",
-        r"\bвход\s*[:\-]?\s*0\s*(?:₽|руб(?:\.|лей)?)\b",
-        r"\bстоимость\s*[:\-]?\s*0\s*(?:₽|руб(?:\.|лей)?)\b",
-        r"\bцена\s*[:\-]?\s*0\s*(?:₽|руб(?:\.|лей)?)\b",
-    ]
-    return any(re.search(pattern, text, re.IGNORECASE) for pattern in free_patterns)
-
-
-def classify_category(title: str, source_text: str = "") -> str:
-    """Определяет тематическую категорию мероприятия. Спорт выделяется отдельно."""
-    text = clean(f"{title} {source_text}").lower()
-    sport_keywords = [
-        "спорт", "спортивн", "футбол", "хоккей", "баскетбол", "волейбол",
-        "теннис", "падел", "бадминтон", "регби", "гандбол", "фигурн",
-        "катани", "лыж", "сноуборд", "биатлон", "триатлон", "плавани",
-        "марафон", "забег", "кросс", "бег", "велогон", "велосипед",
-        "велозаезд", "автоспорт", "автогон", "мотогон", "ралли",
-        "формула-1", "формула 1", "гонка", "картинг", "бокс", "mma",
-        "единоборств", "дзюдо", "самбо", "карате", "тхэквондо",
-        "гимнастик", "легкая атлетика", "тяжелая атлетика", "шахмат",
-        "киберспорт", "турнир", "чемпионат", "первенство", "кубок",
-        "спартакиад", "соревнован", "матч", "старт", "дистанция",
-    ]
-    return "Спорт" if any(x in text for x in sport_keywords) else "Другое"
-
-
-def classify_event(title: str, source_text: str = "") -> str:
-    """Определяет, относится ли запись к разовым или постоянным/длительным.
-
-    Важно: само слово «фестиваль» или «турнир» не делает событие длительным.
-    Длительным оно считается, если источник указывает период/регулярность,
-    либо по названию явно видно, что это постоянная услуга/объект.
-    """
-    text = clean(f"{title} {source_text}").lower()
-
-    # Явная регулярность: каждый день, по выходным, конкретные дни недели и т.п.
-    recurring = [
-        "каждый день", "ежедневно", "ежедневный", "ежедневная", "ежедневное",
-        "каждую неделю", "каждый понедельник", "каждый вторник",
-        "каждую среду", "каждый четверг", "каждую пятницу",
-        "каждую субботу", "каждое воскресенье", "по выходным",
-        "по будням", "еженедельно", "регулярно",
-    ]
-    if any(x in text for x in recurring):
-        return "Постоянные"
-
-    # Период: «с 18 по 30 сентября», «18 сентября — 5 октября» и т.п.
-    has_range = bool(re.search(
-        r"\bс\s+\d{1,2}\s+(?:января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)"
-        r"\s+(?:по|до|—|–|-)+\s+\d{1,2}\s+(?:января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)",
-        text,
-    )) or bool(re.search(r"\b\d{1,2}[./]\d{1,2}\s*[—–-]\s*\d{1,2}[./]\d{1,2}\b", text))
-    if has_range:
-        return "Постоянные"
-
-    # Постоянные услуги/объекты, которые обычно представлены в афише как
-    # доступные в течение длительного периода.
-    permanent_keywords = [
-        "плавание с дельфинами", "дельфинар", "океанариум", "аквариум",
-        "экскурсия", "экскурсии", "музей", "экспозиция", "аттракцион",
-        "канатная дорога", "парк развлечений", "катание на лошадях",
-        "прокат", "посещение", "шоу-программа",
-    ]
-    if any(x in text for x in permanent_keywords):
-        return "Постоянные"
-
-    # Выставка/ярмарка/проект без явной даты окончания остаются разовыми,
-    # если источник не сообщил период. Так мы не будем автоматически
-    # превращать любое однодневное мероприятие в «длительное».
-    return "Разовые"
-
-
-def filter_event_type(e):
-    return e.get("event_type", "Разовые")
-
-def event_source_score(event):
-    return (
-        100 if event.get("official") else 0,
-        20 if event.get("event_page") else 0,
-        len(event.get("url", "")) / 10000,
-    )
-
-
-def choose_better_event(a, b):
-    return b if event_source_score(b) > event_source_score(a) else a
-
-
-def normalized_event_title(title):
-    text = clean(title).lower()
-    text = re.sub(r'^кз\s*[«"]?фестивальный[»"]?\s*[:—-]\s*', "", text)
-    text = re.sub(r'^фестивальный\s*[:—-]\s*', "", text)
-    # Убираем служебные приставки, которые разные сайты добавляют к одному событию.
-    text = re.sub(r'^концерт\s*[•·—–:-]?\s*', "", text)
-    text = re.sub(r'^мероприятие\s*[•·—–:-]?\s*', "", text)
-    # Дата/время в заголовке карточки не является частью названия события.
-    text = re.sub(r'\b\d{1,2}\s+(?:января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)(?:\s+\d{4})?\b', ' ', text)
-    text = re.sub(r'\bв\s+\d{1,2}:\d{2}\b', ' ', text)
-    return re.sub(r"[^a-zа-я0-9]+", "", text)
-
-
-def deduplicate(events):
-    unique = {}
-    for e in events:
-        title_key = normalized_event_title(e.get("title", ""))
-        date_key = e["date"].strftime("%Y-%m-%d %H:%M")
-        area_key = e.get("area", "").lower()
-        key = (title_key, date_key, area_key)
-        unique[key] = choose_better_event(unique[key], e) if key in unique else e
-
-    # Второй проход: карточки-шаблоны одного времени и площадки.
-    # Например «Концерт • 19 сентября в 17:00» не должно жить отдельно
-    # от «Концерт юных артистов балета».
-    result = []
-    for e in sorted(unique.values(), key=lambda x: x["date"]):
-        same_slot = [x for x in result if
-                     x["date"] == e["date"] and
-                     x.get("area", "").lower() == e.get("area", "").lower()]
-        if same_slot:
-            e_title = clean(e.get("title", "")).lower()
-            generic = bool(re.match(r"^концерт(?:\s*[•·—–:-]\s*)?\d{1,2}\s+(?:января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)", e_title))
-            replaced = False
-            for existing in same_slot:
-                x_title = clean(existing.get("title", "")).lower()
-                existing_generic = bool(re.match(r"^концерт(?:\s*[•·—–:-]\s*)?\d{1,2}\s+(?:января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)", x_title))
-                if generic and not existing_generic:
-                    replaced = True
-                    break
-                if existing_generic and not generic:
-                    result[result.index(existing)] = choose_better_event(existing, e)
-                    replaced = True
-                    break
-            if replaced:
-                continue
-        result.append(e)
-    return result
-
-
-def enrich_event_location(e):
-    """Если карточка дала только город, пробуем страницу самого события."""
-    if not is_generic_location(e.get("location", ""), e.get("area", "")):
-        return e
-    try:
-        r = requests.get(e["url"], headers=HEADERS, timeout=10)
-        r.raise_for_status()
-        soup = BeautifulSoup(r.text, "html.parser")
-        for script in soup.find_all("script", type="application/ld+json"):
-            try:
-                data = json.loads(script.string or script.get_text())
-            except Exception:
-                continue
-            objects = data if isinstance(data, list) else [data]
-            for obj in objects:
-                if isinstance(obj, dict) and obj.get("@type") in ("Event", ["Event"]):
-                    loc = location_from_jsonld(obj, e["area"])
-                    if not is_generic_location(loc, e["area"]):
-                        e["location"] = loc
-                        return e
-        body = clean(soup.get_text(" ", strip=True))
-        loc = extract_location(soup, e["area"])
-        if not is_generic_location(loc, e["area"]):
-            e["location"] = loc
-        else:
-            # Дополнительный разбор текста страницы по явным подписям.
-            m = re.search(r"(?:место|площадка|адрес|зал)\s*[:\-]?\s*([^|•·]{3,180}?)(?=\s+(?:время|дата|стоимость|купить|подробнее)\b|$)", body, re.IGNORECASE)
-            if m:
-                candidate = clean(m.group(1).strip(" -|,.:"))
-                if not is_generic_location(candidate, e["area"]):
-                    e["location"] = candidate
-    except Exception:
-        pass
-    return e
-
-
-async def collect_events():
-    global EVENTS, LAST_UPDATE
-    all_events = []
-    for source in SOURCES:
-        try:
-            items = await asyncio.to_thread(extract_from_source, source)
-            logger.info("%s: найдено %s событий", source["name"], len(items))
-            all_events.extend(items)
-        except Exception as exc:
-            logger.exception("Ошибка источника %s: %s", source["name"], exc)
-
-    if all_events:
-        events = deduplicate(all_events)
-        # Обогащаем только события, у которых пока нет конкретной площадки.
-        generic = [e for e in events if is_generic_location(e.get("location", ""), e.get("area", ""))]
-        if generic:
-            enriched = await asyncio.gather(*(asyncio.to_thread(enrich_event_location, e) for e in generic))
-            generic_by_url = {e["url"]: e for e in enriched}
-            events = [generic_by_url.get(e["url"], e) if e["url"] in generic_by_url else e for e in events]
-        EVENTS, LAST_UPDATE = deduplicate(events), datetime.now()
-        logger.info("Всего после объединения и уточнения площадок: %s", len(EVENTS))
-    else:
-        logger.warning("Ни одного события не получено; старые данные оставлены без изменений")
-
-
-def display_location(e):
-    area = e.get("area", "")
-    venue = clean(e.get("location", ""))
-    if not venue or is_generic_location(venue, area):
-        return area
-    if venue.lower().startswith(area.lower() + ","):
-        return venue
-    return f"{area}, {venue}"
-
-
-WEEKDAYS = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"]
-
-
-def event_text(e, show_date=True):
-    time_str = e["date"].strftime("%H:%M") if e["date"].hour or e["date"].minute else "время не указано"
-    place = escape(display_location(e))
-    if show_date:
-        info = f"{e['date'].strftime('%d.%m.%Y')}, {time_str}, {place}"
-    else:
-        info = f"{time_str}, {place}"
-    return f"<b>{escape(e['title'])}</b>\n{info}\n<a href=\"{escape(e['url'], quote=True)}\">Источник</a>"
-
-
-def grouped_event_blocks(events):
-    groups = {}
-    for e in events:
-        groups.setdefault(e["date"].date(), []).append(e)
-    return [(f"<b>{day.strftime('%d.%m.%Y')} — {WEEKDAYS[day.weekday()]}</b>", groups[day]) for day in sorted(groups)]
-
-
-def get_user_filters(user_id):
-    if user_id not in USER_FILTERS:
-        USER_FILTERS[user_id] = {
-            "areas": {"Сочи", "Сириус", "Красная Поляна"},
-            "types": {"Разовые", "Постоянные"},
-            "categories": {"Спорт", "Другое"},
-            "free_only": False,
-        }
-    return USER_FILTERS[user_id]
-
-
-def load_calendar_added_log():
-    """Загружает журнал событий, которые бот фактически добавил в календарь."""
-    global CALENDAR_ADDED_LOG
-    try:
-        if os.path.exists(CALENDAR_LOG_FILE):
-            with open(CALENDAR_LOG_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                CALENDAR_ADDED_LOG = data if isinstance(data, list) else []
-        else:
-            CALENDAR_ADDED_LOG = []
-    except Exception:
-        logger.exception("Не удалось загрузить журнал добавлений в календарь")
-        CALENDAR_ADDED_LOG = []
-
-
-def record_calendar_added(event):
-    """Записывает факт реального добавления события в календарь.
-
-    Эту функцию вызывает модуль синхронизации с Outlook после успешного создания
-    события. Само обнаружение мероприятия в интернете сюда не записывается.
-    """
-    global CALENDAR_ADDED_LOG
-    item = {
-        "added_at": datetime.now().isoformat(),
-        "title": event.get("title", ""),
-        "date": event.get("date").isoformat() if event.get("date") else "",
-        "area": event.get("area", ""),
-        "location": event.get("location", ""),
-        "status": event.get("status", "⚠️ НЕ ПОДТВЕРЖДЕНО"),
-        "source": event.get("source", ""),
-    }
-    CALENDAR_ADDED_LOG.append(item)
-    # Храним журнал за последние 31 день, чтобы файл не рос бесконечно.
-    cutoff = datetime.now() - timedelta(days=31)
-    CALENDAR_ADDED_LOG = [
-        x for x in CALENDAR_ADDED_LOG
-        if x.get("added_at") and datetime.fromisoformat(x["added_at"]) >= cutoff
-    ]
-    try:
-        with open(CALENDAR_LOG_FILE, "w", encoding="utf-8") as f:
-            json.dump(CALENDAR_ADDED_LOG, f, ensure_ascii=False, indent=2)
-    except Exception:
-        logger.exception("Не удалось сохранить журнал добавлений в календарь")
-
-
-def calendar_added_today():
-    today = datetime.now().date()
-    result = []
-    for item in CALENDAR_ADDED_LOG:
-        try:
-            if datetime.fromisoformat(item["added_at"]).date() == today:
-                result.append(item)
-        except Exception:
-            continue
-    return sorted(result, key=lambda x: x.get("added_at", ""), reverse=True)
-
-
-def toggle_filter(user_id, kind, value):
-    filters = get_user_filters(user_id)
-    selected = filters[kind]
-    if value in selected:
-        # Не оставляем пустой набор: если снять последнюю галочку,
-        # возвращаем все значения. Это предотвращает ситуацию «ничего не выбрано».
-        if len(selected) > 1:
-            selected.remove(value)
-        else:
-            if kind == "areas":
-                selected.update({"Сочи", "Сириус", "Красная Поляна"})
-            else:
-                selected.update({"Разовые", "Постоянные"})
-    else:
-        selected.add(value)
-
-
-def button_label(value, selected):
-    return ("✓ " if value in selected else "□ ") + value
-
-
-def menu(user_id):
-    filters = get_user_filters(user_id)
-    return ReplyKeyboardMarkup(keyboard=[
-        [KeyboardButton(text="Сегодня"), KeyboardButton(text="Завтра"), KeyboardButton(text="7 дней")],
-        [
-            KeyboardButton(text=button_label("Сочи", filters["areas"])),
-            KeyboardButton(text=button_label("Сириус", filters["areas"])),
-            KeyboardButton(text=button_label("Красная Поляна", filters["areas"])),
-        ],
-        [
-            KeyboardButton(text=button_label("Разовые", filters["types"])),
-            KeyboardButton(text=button_label("Постоянные", filters["types"])),
-        ],
-        [KeyboardButton(text=button_label("Спорт", filters["categories"]))],
-        [KeyboardButton(text=button_label("Бесплатно", {"Бесплатно"} if filters.get("free_only") else set()))],
-    ], resize_keyboard=True)
-
-
-def apply_filters(user_id, events):
-    filters = get_user_filters(user_id)
-    return [
-        e for e in events
-        if e.get("area") in filters["areas"]
-        and filter_event_type(e) in filters["types"]
-        and (set(filters.get("categories", {"Спорт", "Другое"})) == {"Спорт", "Другое"}
-             or e.get("category", "Другое") in filters.get("categories", {"Спорт", "Другое"}))
-        and (not filters.get("free_only", False) or e.get("free", False))
-    ]
-
-
-async def send_events(message: Message, events, title, group_by_date=False, apply_user_filters=True):
-    if apply_user_filters:
-        events = apply_filters(message.from_user.id, events)
-    if not events:
-        await message.answer(f"<b>{escape(title)}</b>\n\nМероприятий не найдено.", reply_markup=menu(message.from_user.id), parse_mode="HTML")
-        return
-    events = events[:50]
-    chunks, current_events, current_parts = [], [], [f"<b>{escape(title)}</b>\nНайдено: {len(events)}"]
-    if group_by_date:
-        for header, day_events in grouped_event_blocks(events):
-            day_text = header + "\n\n" + "\n────────────\n\n".join(event_text(ev, False) for ev in day_events)
-            if len("\n\n".join(current_parts) + "\n\n" + day_text) > 3500 and current_events:
-                chunks.append((current_parts, current_events))
-                current_parts, current_events = [], []
-            current_parts.append(day_text)
-            current_events.extend(day_events)
-    else:
-        for ev in events:
-            block = event_text(ev)
-            if len("\n\n".join(current_parts) + "\n────────────\n\n" + block) > 3500 and current_events:
-                chunks.append((current_parts, current_events))
-                current_parts, current_events = [], []
-            current_parts.append(block)
-            current_events.append(ev)
-    if current_events:
-        chunks.append((current_parts, current_events))
-    for text_parts, chunk_events in chunks:
-        # После ссылки "Источник" больше нет пустого технического сообщения/кнопки.
-        await message.answer("\n────────────\n\n".join(text_parts), reply_markup=menu(message.from_user.id), parse_mode="HTML")
-
-
-def load_subscribers():
-    global SUBSCRIBER_CHAT_IDS
-    try:
-        if os.path.exists(SUBSCRIBERS_FILE):
-            with open(SUBSCRIBERS_FILE, "r", encoding="utf-8") as f:
-                SUBSCRIBER_CHAT_IDS = {int(x) for x in json.load(f)}
-    except Exception:
-        logger.exception("Не удалось загрузить список подписчиков")
-
-
-def save_subscribers():
-    try:
-        with open(SUBSCRIBERS_FILE, "w", encoding="utf-8") as f:
-            json.dump(sorted(SUBSCRIBER_CHAT_IDS), f)
-    except Exception:
-        logger.exception("Не удалось сохранить список подписчиков")
 
 
 @dp.message(Command("start"))
 async def start(message: Message):
-    SUBSCRIBER_CHAT_IDS.add(message.chat.id)
+    SUBSCRIBERS.add(message.chat.id)
     save_subscribers()
-    await message.answer(f"<b>Афиша Сочи и Сириуса</b>\n\nМероприятия из реальных источников.\nИспользуйте кнопки ниже.\n\nВерсия бота: <b>{BOT_VERSION}</b>", reply_markup=menu(message.from_user.id), parse_mode="HTML")
+    await message.answer(
+        f"<b>Афиша Сочи | Сириус | Красная Поляна</b>\n\n"
+        f"Источник данных: ваш Outlook Calendar.\n"
+        f"Событий загружено: {len(EVENTS)}\n\n"
+        f"Версия: {BOT_VERSION}",
+        parse_mode="HTML",
+        reply_markup=menu(message.from_user.id),
+    )
 
 
 @dp.message(Command("version"))
 async def version_cmd(message: Message):
-    await message.answer(f"Версия бота: <b>{BOT_VERSION}</b>", parse_mode="HTML", reply_markup=menu(message.from_user.id))
-
-
-@dp.message(Command("help"))
-async def help_cmd(message: Message):
-    await message.answer("Команды:\n/today — сегодня\n/tomorrow — завтра\n/week — ближайшие 7 дней\n/new — что добавлено в календарь сегодня\n/источник — сайты, которые ежедневно мониторит бот\n\nАфиша автоматически обновляется при каждом запуске бота и затем каждые 30 минут.", reply_markup=menu(message.from_user.id))
-
-
-def sources_message() -> str:
-    lines = ["<b>Источники ежедневного мониторинга</b>", ""]
-    for i, source in enumerate(SOURCES, 1):
-        status = "официальный" if source.get("official") else "агрегатор"
-        lines.append(
-            f"{i}. <b>{escape(source['name'])}</b> — {status}\n"
-            f"   <a href=\"{escape(source['url'], quote=True)}\">{escape(source['url'])}</a>"
-        )
-    lines.append("")
-    lines.append(f"Всего источников: <b>{len(SOURCES)}</b>")
-    return "\n".join(lines)
-
-
-# Telegram Bot API обычно ожидает латинские команды, поэтому дополнительно
-# поддерживаем /source. При этом пользовательская команда /источник тоже работает.
-@dp.message(Command("source"))
-@dp.message(lambda m: (m.text or "").split()[0].lower() == "/источник")
-async def sources_cmd(message: Message):
-    await message.answer(
-        sources_message(),
-        reply_markup=menu(message.from_user.id),
-        parse_mode="HTML",
-        disable_web_page_preview=True,
-    )
-
-
-@dp.message(Command("sport"))
-async def sport_command(message: Message):
-    get_user_filters(message.from_user.id)["categories"] = {"Спорт"}
-    await send_events(message, [e for e in EVENTS if e.get("category") == "Спорт"], "Спорт", apply_user_filters=False)
-
-
-@dp.message(Command("free"))
-async def free_command(message: Message):
-    get_user_filters(message.from_user.id)["free_only"] = True
-    await send_events(message, [e for e in EVENTS if e.get("free")], "Бесплатно", apply_user_filters=False)
-
-
-@dp.message(lambda m: m.text in {"Спорт", "✓ Спорт", "□ Спорт"})
-async def sport_filter(message: Message):
-    filters = get_user_filters(message.from_user.id)
-    selected = filters["categories"]
-    if selected == {"Спорт", "Другое"}:
-        filters["categories"] = {"Спорт"}
-    else:
-        filters["categories"] = {"Спорт", "Другое"}
-    category_text = "только Спорт" if filters["categories"] == {"Спорт"} else "все категории"
-    await message.answer(f"Категория: {category_text}", reply_markup=menu(message.from_user.id))
-
-
-@dp.message(lambda m: m.text in {"Бесплатно", "✓ Бесплатно", "□ Бесплатно"})
-async def free_filter(message: Message):
-    filters = get_user_filters(message.from_user.id)
-    filters["free_only"] = not filters.get("free_only", False)
-    status = "только бесплатные мероприятия" if filters["free_only"] else "все мероприятия"
-    await message.answer(f"Фильтр: {status}", reply_markup=menu(message.from_user.id))
-
-
-@dp.message(Command("new"))
-@dp.message(lambda m: m.text == "Новое")
-async def new_events(message: Message):
-    items = calendar_added_today()
-    if not items:
-        await message.answer(
-            "<b>Новое</b>\n\nСегодня бот пока ничего не добавил в календарь.",
-            reply_markup=menu(message.from_user.id),
-            parse_mode="HTML",
-        )
-        return
-
-    parts = [f"<b>Новое за сегодня</b>\nДобавлено в календарь: <b>{len(items)}</b>\n"]
-    for item in items:
-        dt = item.get("date", "")
-        try:
-            event_dt = datetime.fromisoformat(dt)
-            date_text = event_dt.strftime("%d.%m.%Y")
-            time_text = event_dt.strftime("%H:%M") if event_dt.hour or event_dt.minute else "время не указано"
-        except Exception:
-            date_text, time_text = dt, ""
-        location = item.get("location") or item.get("area") or "Место не указано"
-        status = item.get("status") or "⚠️ НЕ ПОДТВЕРЖДЕНО"
-        parts.append(
-            f"<b>{escape(item.get('title', 'Без названия'))}</b>\n"
-            f"📅 {date_text} {time_text}\n"
-            f"📍 {escape(location)}\n"
-            f"{escape(status)}"
-        )
-    await message.answer("\n\n────────────\n\n".join(parts), reply_markup=menu(message.from_user.id), parse_mode="HTML")
+    await message.answer(f"Версия: <b>{BOT_VERSION}</b>\nИсточник: Outlook Calendar (ICS)", parse_mode="HTML", reply_markup=menu(message.from_user.id))
 
 
 @dp.message(Command("today"))
 @dp.message(lambda m: m.text == "Сегодня")
-async def today(message: Message):
-    d = datetime.now().date()
-    await send_events(message, [e for e in EVENTS if e["date"].date() == d], "Сегодня")
+async def today_cmd(message: Message):
+    await send_event_list(message, get_events_for_day(datetime.now(MOSCOW_TZ).date()), "Сегодня")
 
 
 @dp.message(Command("tomorrow"))
 @dp.message(lambda m: m.text == "Завтра")
-async def tomorrow(message: Message):
-    d = (datetime.now() + timedelta(days=1)).date()
-    await send_events(message, [e for e in EVENTS if e["date"].date() == d], "Завтра")
+async def tomorrow_cmd(message: Message):
+    day = datetime.now(MOSCOW_TZ).date() + timedelta(days=1)
+    await send_event_list(message, get_events_for_day(day), "Завтра")
 
 
 @dp.message(Command("week"))
 @dp.message(lambda m: m.text == "7 дней")
-async def week(message: Message):
-    now, end = datetime.now(), datetime.now() + timedelta(days=7)
-    await send_events(message, [e for e in EVENTS if now <= e["date"] <= end], "Ближайшие 7 дней", group_by_date=True)
+async def week_cmd(message: Message):
+    now = datetime.now(MOSCOW_TZ)
+    end = now + timedelta(days=7)
+    events = [e for e in EVENTS if now <= e["date"] <= end and not e["cancelled"]]
+    await send_event_list(message, events, "Ближайшие 7 дней")
 
 
-@dp.message(lambda m: m.text in {"Сочи", "✓ Сочи", "□ Сочи"})
-async def sochi(message: Message):
-    toggle_filter(message.from_user.id, "areas", "Сочи")
-    filters = get_user_filters(message.from_user.id)
-    areas = ", ".join(sorted(filters["areas"], key=["Сочи", "Сириус", "Красная Поляна"].index))
-    types = ", ".join(sorted(filters["types"], key=["Разовые", "Постоянные"].index))
-    await message.answer(f"Выбраны города: {areas}\nВыбраны типы: {types}", reply_markup=menu(message.from_user.id))
+@dp.message(Command("главное"))
+async def main_cmd(message: Message):
+    SUBSCRIBERS.add(message.chat.id)
+    save_subscribers()
+    await send_highlight_proposals(message.chat.id)
 
 
-@dp.message(lambda m: m.text in {"Сириус", "✓ Сириус", "□ Сириус"})
-async def sirius(message: Message):
-    toggle_filter(message.from_user.id, "areas", "Сириус")
-    filters = get_user_filters(message.from_user.id)
-    areas = ", ".join(sorted(filters["areas"], key=["Сочи", "Сириус", "Красная Поляна"].index))
-    types = ", ".join(sorted(filters["types"], key=["Разовые", "Постоянные"].index))
-    await message.answer(f"Выбраны города: {areas}\nВыбраны типы: {types}", reply_markup=menu(message.from_user.id))
-
-
-@dp.message(lambda m: m.text in {"Красная Поляна", "✓ Красная Поляна", "□ Красная Поляна"})
-async def krasnaya_polyana(message: Message):
-    toggle_filter(message.from_user.id, "areas", "Красная Поляна")
-    filters = get_user_filters(message.from_user.id)
-    areas = ", ".join(sorted(filters["areas"], key=["Сочи", "Сириус", "Красная Поляна"].index))
-    types = ", ".join(sorted(filters["types"], key=["Разовые", "Постоянные"].index))
-    await message.answer(f"Выбраны города: {areas}\nВыбраны типы: {types}", reply_markup=menu(message.from_user.id))
-
-
-@dp.message(lambda m: m.text in {"Разовые", "✓ Разовые", "□ Разовые"})
-async def one_time(message: Message):
-    toggle_filter(message.from_user.id, "types", "Разовые")
-    filters = get_user_filters(message.from_user.id)
-    types = ", ".join(sorted(filters["types"], key=["Разовые", "Постоянные"].index))
-    areas = ", ".join(sorted(filters["areas"], key=["Сочи", "Сириус", "Красная Поляна"].index))
-    await message.answer(f"Выбраны типы: {types}\nВыбраны города: {areas}", reply_markup=menu(message.from_user.id))
-
-
-@dp.message(lambda m: m.text in {"Постоянные", "✓ Постоянные", "□ Постоянные"})
-async def long_term(message: Message):
-    toggle_filter(message.from_user.id, "types", "Постоянные")
-    filters = get_user_filters(message.from_user.id)
-    types = ", ".join(sorted(filters["types"], key=["Разовые", "Постоянные"].index))
-    areas = ", ".join(sorted(filters["areas"], key=["Сочи", "Сириус", "Красная Поляна"].index))
-    await message.answer(f"Выбраны типы: {types}\nВыбраны города: {areas}", reply_markup=menu(message.from_user.id))
-
-
-@dp.message(lambda m: (m.text or "").strip().lower() in {"/стоп", "/stop"})
-async def stop_highlight(message: Message):
+@dp.message(lambda m: (m.text or "").lower() in {"/стоп", "/stop"})
+async def stop_cmd(message: Message):
     global AUTO_HIGHLIGHT_ENABLED
     AUTO_HIGHLIGHT_ENABLED = False
-    HIGHLIGHT_PROPOSALS.pop(message.chat.id, None)
+    await message.answer("🛑 Автоматическое предложение главного события остановлено. Остальные функции продолжают работать.", reply_markup=menu(message.from_user.id))
+
+
+@dp.message(Command("source"))
+@dp.message(lambda m: (m.text or "").split()[0].lower() == "/источник")
+async def source_cmd(message: Message):
     await message.answer(
-        "🛑 <b>Автоматическое предложение главного события остановлено.</b>\n\n"
-        "Бот больше не будет сам предлагать 3 варианта главного события. Остальные функции афиши продолжают работать.",
+        "<b>Источник событий</b>\n\n"
+        "Бот получает мероприятия только из вашего Outlook Calendar через опубликованный ICS.\n"
+        "Внешние сайты больше не используются для сбора списка событий.",
         parse_mode="HTML",
         reply_markup=menu(message.from_user.id),
     )
 
 
-@dp.callback_query(lambda c: c.data and c.data.startswith("highlight_select:"))
-async def highlight_select(callback: CallbackQuery):
+@dp.message(Command("help"))
+async def help_cmd(message: Message):
+    await message.answer(
+        "<b>Команды</b>\n"
+        "/today — сегодня\n"
+        "/tomorrow — завтра\n"
+        "/week — 7 дней\n"
+        "/главное — предложить 3 кандидата\n"
+        "/стоп — остановить автоматическое предложение главного\n"
+        "/source — источник данных\n"
+        "/version — версия",
+        parse_mode="HTML",
+        reply_markup=menu(message.from_user.id),
+    )
+
+
+@dp.message(lambda m: m.text in {"✓ Сочи", "□ Сочи", "Сочи"})
+async def area_sochi(message: Message):
+    f = get_filters(message.from_user.id)
+    if "Сочи" in f["areas"] and len(f["areas"]) == 1:
+        f["areas"] = set(AREA_ORDER)
+    elif "Сочи" in f["areas"]:
+        f["areas"].remove("Сочи")
+    else:
+        f["areas"].add("Сочи")
+    await message.answer("Фильтр обновлён.", reply_markup=menu(message.from_user.id))
+
+
+@dp.message(lambda m: m.text in {"✓ Сириус", "□ Сириус", "Сириус"})
+async def area_sirius(message: Message):
+    f = get_filters(message.from_user.id)
+    if "Сириус" in f["areas"] and len(f["areas"]) == 1:
+        f["areas"] = set(AREA_ORDER)
+    elif "Сириус" in f["areas"]:
+        f["areas"].remove("Сириус")
+    else:
+        f["areas"].add("Сириус")
+    await message.answer("Фильтр обновлён.", reply_markup=menu(message.from_user.id))
+
+
+@dp.message(lambda m: m.text in {"✓ Красная Поляна", "□ Красная Поляна", "Красная Поляна"})
+async def area_kp(message: Message):
+    f = get_filters(message.from_user.id)
+    if "Красная Поляна" in f["areas"] and len(f["areas"]) == 1:
+        f["areas"] = set(AREA_ORDER)
+    elif "Красная Поляна" in f["areas"]:
+        f["areas"].remove("Красная Поляна")
+    else:
+        f["areas"].add("Красная Поляна")
+    await message.answer("Фильтр обновлён.", reply_markup=menu(message.from_user.id))
+
+
+@dp.message(lambda m: m.text in {"✓ Разовые", "□ Разовые", "Разовые"})
+async def type_one(message: Message):
+    f = get_filters(message.from_user.id)
+    if "Разовые" in f["types"] and len(f["types"]) == 1:
+        f["types"] = set(TYPE_ORDER)
+    elif "Разовые" in f["types"]:
+        f["types"].remove("Разовые")
+    else:
+        f["types"].add("Разовые")
+    await message.answer("Фильтр обновлён.", reply_markup=menu(message.from_user.id))
+
+
+@dp.message(lambda m: m.text in {"✓ Постоянные", "□ Постоянные", "Постоянные"})
+async def type_regular(message: Message):
+    f = get_filters(message.from_user.id)
+    if "Постоянные" in f["types"] and len(f["types"]) == 1:
+        f["types"] = set(TYPE_ORDER)
+    elif "Постоянные" in f["types"]:
+        f["types"].remove("Постоянные")
+    else:
+        f["types"].add("Постоянные")
+    await message.answer("Фильтр обновлён.", reply_markup=menu(message.from_user.id))
+
+
+@dp.message(lambda m: m.text in {"✓ Спорт", "□ Спорт", "Спорт"})
+async def sport_filter(message: Message):
+    f = get_filters(message.from_user.id)
+    f["sports_only"] = not f["sports_only"]
+    await message.answer("Фильтр спорта обновлён.", reply_markup=menu(message.from_user.id))
+
+
+@dp.message(lambda m: m.text in {"✓ Бесплатно", "□ Бесплатно", "Бесплатно"})
+async def free_filter(message: Message):
+    f = get_filters(message.from_user.id)
+    f["free_only"] = not f["free_only"]
+    await message.answer("Фильтр бесплатных обновлён.", reply_markup=menu(message.from_user.id))
+
+
+@dp.callback_query(lambda c: c.data and c.data.startswith("highlight:"))
+async def highlight_callback(callback: CallbackQuery):
     chat_id = callback.message.chat.id if callback.message else callback.from_user.id
     candidates = HIGHLIGHT_PROPOSALS.get(chat_id, [])
     try:
@@ -1258,36 +890,27 @@ async def highlight_select(callback: CallbackQuery):
     except Exception:
         index = -1
     if index < 0 or index >= len(candidates):
-        await callback.answer("Этот список вариантов уже неактуален.", show_alert=True)
+        await callback.answer("Варианты уже устарели.", show_alert=True)
         return
+
     event = candidates[index]
-    await callback.answer("Выбрано")
-    ok = await publish_selected_highlight(event)
+    ok = await publish_highlight(event)
+    await callback.answer("Опубликовано" if ok else "Ошибка публикации")
     if ok:
         HIGHLIGHT_PROPOSALS.pop(chat_id, None)
-        await callback.message.answer(
-            f"✅ Опубликовано: <b>{escape(event['title'])}</b>",
-            parse_mode="HTML",
-        )
-    else:
-        await callback.message.answer("Не удалось опубликовать выбранное мероприятие. Проверьте логи Render.")
-
-
-@dp.message(Command("главное"))
-async def manual_highlight(message: Message):
-    if message.chat.type == "private":
-        SUBSCRIBER_CHAT_IDS.add(message.chat.id)
-        save_subscribers()
-    candidates = get_highlight_candidates()
-    if not candidates:
-        await message.answer("Не удалось найти кандидатов на главное событие.")
-        return
-    await send_highlight_proposals(message.chat.id, candidates)
+        await callback.message.answer(f"✅ Опубликовано: <b>{html.escape(event['title'])}</b>", parse_mode="HTML")
 
 
 @app.get("/")
 async def root():
-    return {"status": "ok", "bot": "SochiSiriusEventsBot", "version": BOT_VERSION, "events": len(EVENTS), "last_update": LAST_UPDATE.isoformat() if LAST_UPDATE else None}
+    return {
+        "status": "ok",
+        "bot": "SochiSiriusEventsBot",
+        "version": BOT_VERSION,
+        "source": "Outlook ICS",
+        "events": len(EVENTS),
+        "last_update": LAST_UPDATE.isoformat() if LAST_UPDATE else None,
+    }
 
 
 @app.api_route("/health", methods=["GET", "HEAD"])
@@ -1295,13 +918,13 @@ async def health():
     return {"status": "ok", "version": BOT_VERSION, "events": len(EVENTS)}
 
 
-async def collector_loop():
+async def refresh_loop():
     while True:
+        await asyncio.sleep(300)
         try:
             await collect_events()
         except Exception:
-            logger.exception("Ошибка фонового сборщика")
-        await asyncio.sleep(1800)
+            logger.exception("Ошибка обновления Outlook ICS")
 
 
 async def bot_loop():
@@ -1310,24 +933,24 @@ async def bot_loop():
 
 
 async def main():
-    load_calendar_added_log()
     load_subscribers()
     await collect_events()
-    collector_task = asyncio.create_task(collector_loop())
-    bot_task = asyncio.create_task(bot_loop())
-    daily_program_task = asyncio.create_task(daily_program_loop())
-    daily_highlight_task = asyncio.create_task(daily_highlight_loop())
-    config = uvicorn.Config(app, host="0.0.0.0", port=int(os.getenv("PORT", "10000")), log_level="info")
-    server = uvicorn.Server(config)
+    tasks = [
+        asyncio.create_task(refresh_loop()),
+        asyncio.create_task(bot_loop()),
+        asyncio.create_task(daily_schedule_loop()),
+        asyncio.create_task(daily_highlight_loop()),
+    ]
+    server = uvicorn.Server(
+        uvicorn.Config(app, host="0.0.0.0", port=int(os.getenv("PORT", "10000")), log_level="info")
+    )
     web_task = asyncio.create_task(server.serve())
+    tasks.append(web_task)
     try:
-        await asyncio.gather(collector_task, bot_task, daily_program_task, daily_highlight_task, web_task)
+        await asyncio.gather(*tasks)
     finally:
-        collector_task.cancel()
-        bot_task.cancel()
-        daily_program_task.cancel()
-        daily_highlight_task.cancel()
-        web_task.cancel()
+        for task in tasks:
+            task.cancel()
         await bot.session.close()
 
 
