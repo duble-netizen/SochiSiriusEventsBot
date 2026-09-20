@@ -21,7 +21,7 @@ import uvicorn
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("sochi_events_bot")
 
-BOT_VERSION = "2.1.2-IMAGE-FIX-15:30"
+BOT_VERSION = "2.2.0-DAILY-PROGRAM-11-1130"
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is not set")
@@ -442,12 +442,98 @@ async def publish_selected_highlight(event):
         HIGHLIGHT_SENDING = False
 
 
+
+DAILY_PROGRAM_START = (11, 0)
+DAILY_PROGRAM_END = (11, 30)
+
+
+async def publish_daily_program():
+    """Публикует в Telegram-канал полную программу мероприятий на сегодня."""
+    day = datetime.now(MOSCOW_TZ).date()
+    events = [e for e in EVENTS if e.get("date") and e["date"].date() == day]
+    events = sorted(events, key=lambda e: e["date"])
+
+    if not events:
+        await bot.send_message(
+            CHANNEL_ID,
+            f"<b>Афиша на сегодня — {day.strftime('%d.%m.%Y')}</b>\n\n"
+            "Актуальных мероприятий не найдено.",
+            parse_mode="HTML",
+        )
+        return True
+
+    header = (
+        f"<b>📅 Афиша на сегодня — {day.strftime('%d.%m.%Y')}</b>\n"
+        f"Найдено мероприятий: <b>{len(events)}</b>\n"
+        "Сочи • Сириус • Красная Поляна"
+    )
+    await bot.send_message(CHANNEL_ID, header, parse_mode="HTML")
+
+    sent = 0
+    for event in events:
+        text = event_text(event, show_date=False)
+        try:
+            image_file = download_event_image(event)
+            if image_file:
+                await bot.send_photo(
+                    CHANNEL_ID,
+                    image_file,
+                    caption=text,
+                    parse_mode="HTML",
+                )
+            else:
+                await bot.send_message(CHANNEL_ID, text, parse_mode="HTML")
+            sent += 1
+        except Exception:
+            logger.exception(
+                "Не удалось опубликовать мероприятие в ежедневной программе: %s",
+                event.get("title", ""),
+            )
+            try:
+                await bot.send_message(CHANNEL_ID, text, parse_mode="HTML")
+                sent += 1
+            except Exception:
+                logger.exception(
+                    "Повторная отправка мероприятия не удалась: %s",
+                    event.get("title", ""),
+                )
+
+    logger.info(
+        "Ежедневная программа опубликована в канале %s: %s/%s",
+        CHANNEL_ID,
+        sent,
+        len(events),
+    )
+    return sent > 0
+
+
+async def daily_program_loop():
+    """Ежедневно пытается опубликовать программу в окне 11:00–11:30 по Москве."""
+    while True:
+        try:
+            now = datetime.now(MOSCOW_TZ)
+            day = now.date()
+            current = (now.hour, now.minute)
+
+            in_window = DAILY_PROGRAM_START <= current < DAILY_PROGRAM_END
+
+            if in_window and not publication_sent("daily_program_v2_2", day):
+                ok = await publish_daily_program()
+                if ok:
+                    mark_publication("daily_program_v2_2", day)
+
+        except Exception:
+            logger.exception("Ошибка ежедневной публикации программы")
+
+        await asyncio.sleep(30)
+
+
 HIGHLIGHT_TEST_DATE = "2026-09-19"
-HIGHLIGHT_TEST_START = (15, 30)
-HIGHLIGHT_TEST_END = (15, 35)
+HIGHLIGHT_TEST_START = (12, 0)
+HIGHLIGHT_TEST_END = (12, 30)
 
 async def daily_highlight_loop():
-    """В 15:30 предлагает три варианта. Автоматической публикации без выбора нет."""
+    """С 12:00 до 12:30 предлагает три варианта. Автоматической публикации без выбора нет."""
     global AUTO_HIGHLIGHT_ENABLED
     while True:
         try:
@@ -460,7 +546,7 @@ async def daily_highlight_loop():
             if day.isoformat() == HIGHLIGHT_TEST_DATE:
                 in_window = HIGHLIGHT_TEST_START <= current < HIGHLIGHT_TEST_END
             else:
-                in_window = (15, 30) <= current < (15, 35)
+                in_window = (12, 0) <= current < (12, 30)
 
             if in_window and not publication_sent("highlight_proposal_v2_1", day):
                 candidates = get_highlight_candidates()
@@ -998,281 +1084,3 @@ def load_subscribers():
                 SUBSCRIBER_CHAT_IDS = {int(x) for x in json.load(f)}
     except Exception:
         logger.exception("Не удалось загрузить список подписчиков")
-
-
-def save_subscribers():
-    try:
-        with open(SUBSCRIBERS_FILE, "w", encoding="utf-8") as f:
-            json.dump(sorted(SUBSCRIBER_CHAT_IDS), f)
-    except Exception:
-        logger.exception("Не удалось сохранить список подписчиков")
-
-
-@dp.message(Command("start"))
-async def start(message: Message):
-    SUBSCRIBER_CHAT_IDS.add(message.chat.id)
-    save_subscribers()
-    await message.answer(f"<b>Афиша Сочи и Сириуса</b>\n\nМероприятия из реальных источников.\nИспользуйте кнопки ниже.\n\nВерсия бота: <b>{BOT_VERSION}</b>", reply_markup=menu(message.from_user.id), parse_mode="HTML")
-
-
-@dp.message(Command("version"))
-async def version_cmd(message: Message):
-    await message.answer(f"Версия бота: <b>{BOT_VERSION}</b>", parse_mode="HTML", reply_markup=menu(message.from_user.id))
-
-
-@dp.message(Command("help"))
-async def help_cmd(message: Message):
-    await message.answer("Команды:\n/today — сегодня\n/tomorrow — завтра\n/week — ближайшие 7 дней\n/new — что добавлено в календарь сегодня\n/источник — сайты, которые ежедневно мониторит бот\n\nАфиша автоматически обновляется при каждом запуске бота и затем каждые 30 минут.", reply_markup=menu(message.from_user.id))
-
-
-def sources_message() -> str:
-    lines = ["<b>Источники ежедневного мониторинга</b>", ""]
-    for i, source in enumerate(SOURCES, 1):
-        status = "официальный" if source.get("official") else "агрегатор"
-        lines.append(
-            f"{i}. <b>{escape(source['name'])}</b> — {status}\n"
-            f"   <a href=\"{escape(source['url'], quote=True)}\">{escape(source['url'])}</a>"
-        )
-    lines.append("")
-    lines.append(f"Всего источников: <b>{len(SOURCES)}</b>")
-    return "\n".join(lines)
-
-
-# Telegram Bot API обычно ожидает латинские команды, поэтому дополнительно
-# поддерживаем /source. При этом пользовательская команда /источник тоже работает.
-@dp.message(Command("source"))
-@dp.message(lambda m: (m.text or "").split()[0].lower() == "/источник")
-async def sources_cmd(message: Message):
-    await message.answer(
-        sources_message(),
-        reply_markup=menu(message.from_user.id),
-        parse_mode="HTML",
-        disable_web_page_preview=True,
-    )
-
-
-@dp.message(Command("sport"))
-async def sport_command(message: Message):
-    get_user_filters(message.from_user.id)["categories"] = {"Спорт"}
-    await send_events(message, [e for e in EVENTS if e.get("category") == "Спорт"], "Спорт", apply_user_filters=False)
-
-
-@dp.message(Command("free"))
-async def free_command(message: Message):
-    get_user_filters(message.from_user.id)["free_only"] = True
-    await send_events(message, [e for e in EVENTS if e.get("free")], "Бесплатно", apply_user_filters=False)
-
-
-@dp.message(lambda m: m.text in {"Спорт", "✓ Спорт", "□ Спорт"})
-async def sport_filter(message: Message):
-    filters = get_user_filters(message.from_user.id)
-    selected = filters["categories"]
-    if selected == {"Спорт", "Другое"}:
-        filters["categories"] = {"Спорт"}
-    else:
-        filters["categories"] = {"Спорт", "Другое"}
-    category_text = "только Спорт" if filters["categories"] == {"Спорт"} else "все категории"
-    await message.answer(f"Категория: {category_text}", reply_markup=menu(message.from_user.id))
-
-
-@dp.message(lambda m: m.text in {"Бесплатно", "✓ Бесплатно", "□ Бесплатно"})
-async def free_filter(message: Message):
-    filters = get_user_filters(message.from_user.id)
-    filters["free_only"] = not filters.get("free_only", False)
-    status = "только бесплатные мероприятия" if filters["free_only"] else "все мероприятия"
-    await message.answer(f"Фильтр: {status}", reply_markup=menu(message.from_user.id))
-
-
-@dp.message(Command("new"))
-@dp.message(lambda m: m.text == "Новое")
-async def new_events(message: Message):
-    items = calendar_added_today()
-    if not items:
-        await message.answer(
-            "<b>Новое</b>\n\nСегодня бот пока ничего не добавил в календарь.",
-            reply_markup=menu(message.from_user.id),
-            parse_mode="HTML",
-        )
-        return
-
-    parts = [f"<b>Новое за сегодня</b>\nДобавлено в календарь: <b>{len(items)}</b>\n"]
-    for item in items:
-        dt = item.get("date", "")
-        try:
-            event_dt = datetime.fromisoformat(dt)
-            date_text = event_dt.strftime("%d.%m.%Y")
-            time_text = event_dt.strftime("%H:%M") if event_dt.hour or event_dt.minute else "время не указано"
-        except Exception:
-            date_text, time_text = dt, ""
-        location = item.get("location") or item.get("area") or "Место не указано"
-        status = item.get("status") or "⚠️ НЕ ПОДТВЕРЖДЕНО"
-        parts.append(
-            f"<b>{escape(item.get('title', 'Без названия'))}</b>\n"
-            f"📅 {date_text} {time_text}\n"
-            f"📍 {escape(location)}\n"
-            f"{escape(status)}"
-        )
-    await message.answer("\n\n────────────\n\n".join(parts), reply_markup=menu(message.from_user.id), parse_mode="HTML")
-
-
-@dp.message(Command("today"))
-@dp.message(lambda m: m.text == "Сегодня")
-async def today(message: Message):
-    d = datetime.now().date()
-    await send_events(message, [e for e in EVENTS if e["date"].date() == d], "Сегодня")
-
-
-@dp.message(Command("tomorrow"))
-@dp.message(lambda m: m.text == "Завтра")
-async def tomorrow(message: Message):
-    d = (datetime.now() + timedelta(days=1)).date()
-    await send_events(message, [e for e in EVENTS if e["date"].date() == d], "Завтра")
-
-
-@dp.message(Command("week"))
-@dp.message(lambda m: m.text == "7 дней")
-async def week(message: Message):
-    now, end = datetime.now(), datetime.now() + timedelta(days=7)
-    await send_events(message, [e for e in EVENTS if now <= e["date"] <= end], "Ближайшие 7 дней", group_by_date=True)
-
-
-@dp.message(lambda m: m.text in {"Сочи", "✓ Сочи", "□ Сочи"})
-async def sochi(message: Message):
-    toggle_filter(message.from_user.id, "areas", "Сочи")
-    filters = get_user_filters(message.from_user.id)
-    areas = ", ".join(sorted(filters["areas"], key=["Сочи", "Сириус", "Красная Поляна"].index))
-    types = ", ".join(sorted(filters["types"], key=["Разовые", "Постоянные"].index))
-    await message.answer(f"Выбраны города: {areas}\nВыбраны типы: {types}", reply_markup=menu(message.from_user.id))
-
-
-@dp.message(lambda m: m.text in {"Сириус", "✓ Сириус", "□ Сириус"})
-async def sirius(message: Message):
-    toggle_filter(message.from_user.id, "areas", "Сириус")
-    filters = get_user_filters(message.from_user.id)
-    areas = ", ".join(sorted(filters["areas"], key=["Сочи", "Сириус", "Красная Поляна"].index))
-    types = ", ".join(sorted(filters["types"], key=["Разовые", "Постоянные"].index))
-    await message.answer(f"Выбраны города: {areas}\nВыбраны типы: {types}", reply_markup=menu(message.from_user.id))
-
-
-@dp.message(lambda m: m.text in {"Красная Поляна", "✓ Красная Поляна", "□ Красная Поляна"})
-async def krasnaya_polyana(message: Message):
-    toggle_filter(message.from_user.id, "areas", "Красная Поляна")
-    filters = get_user_filters(message.from_user.id)
-    areas = ", ".join(sorted(filters["areas"], key=["Сочи", "Сириус", "Красная Поляна"].index))
-    types = ", ".join(sorted(filters["types"], key=["Разовые", "Постоянные"].index))
-    await message.answer(f"Выбраны города: {areas}\nВыбраны типы: {types}", reply_markup=menu(message.from_user.id))
-
-
-@dp.message(lambda m: m.text in {"Разовые", "✓ Разовые", "□ Разовые"})
-async def one_time(message: Message):
-    toggle_filter(message.from_user.id, "types", "Разовые")
-    filters = get_user_filters(message.from_user.id)
-    types = ", ".join(sorted(filters["types"], key=["Разовые", "Постоянные"].index))
-    areas = ", ".join(sorted(filters["areas"], key=["Сочи", "Сириус", "Красная Поляна"].index))
-    await message.answer(f"Выбраны типы: {types}\nВыбраны города: {areas}", reply_markup=menu(message.from_user.id))
-
-
-@dp.message(lambda m: m.text in {"Постоянные", "✓ Постоянные", "□ Постоянные"})
-async def long_term(message: Message):
-    toggle_filter(message.from_user.id, "types", "Постоянные")
-    filters = get_user_filters(message.from_user.id)
-    types = ", ".join(sorted(filters["types"], key=["Разовые", "Постоянные"].index))
-    areas = ", ".join(sorted(filters["areas"], key=["Сочи", "Сириус", "Красная Поляна"].index))
-    await message.answer(f"Выбраны типы: {types}\nВыбраны города: {areas}", reply_markup=menu(message.from_user.id))
-
-
-@dp.message(lambda m: (m.text or "").strip().lower() in {"/стоп", "/stop"})
-async def stop_highlight(message: Message):
-    global AUTO_HIGHLIGHT_ENABLED
-    AUTO_HIGHLIGHT_ENABLED = False
-    HIGHLIGHT_PROPOSALS.pop(message.chat.id, None)
-    await message.answer(
-        "🛑 <b>Автоматическое предложение главного события остановлено.</b>\n\n"
-        "Бот больше не будет сам предлагать 3 варианта главного события. Остальные функции афиши продолжают работать.",
-        parse_mode="HTML",
-        reply_markup=menu(message.from_user.id),
-    )
-
-
-@dp.callback_query(lambda c: c.data and c.data.startswith("highlight_select:"))
-async def highlight_select(callback: CallbackQuery):
-    chat_id = callback.message.chat.id if callback.message else callback.from_user.id
-    candidates = HIGHLIGHT_PROPOSALS.get(chat_id, [])
-    try:
-        index = int(callback.data.split(":", 1)[1])
-    except Exception:
-        index = -1
-    if index < 0 or index >= len(candidates):
-        await callback.answer("Этот список вариантов уже неактуален.", show_alert=True)
-        return
-    event = candidates[index]
-    await callback.answer("Выбрано")
-    ok = await publish_selected_highlight(event)
-    if ok:
-        HIGHLIGHT_PROPOSALS.pop(chat_id, None)
-        await callback.message.answer(
-            f"✅ Опубликовано: <b>{escape(event['title'])}</b>",
-            parse_mode="HTML",
-        )
-    else:
-        await callback.message.answer("Не удалось опубликовать выбранное мероприятие. Проверьте логи Render.")
-
-
-@dp.message(Command("главное"))
-async def manual_highlight(message: Message):
-    if message.chat.type == "private":
-        SUBSCRIBER_CHAT_IDS.add(message.chat.id)
-        save_subscribers()
-    candidates = get_highlight_candidates()
-    if not candidates:
-        await message.answer("Не удалось найти кандидатов на главное событие.")
-        return
-    await send_highlight_proposals(message.chat.id, candidates)
-
-
-@app.get("/")
-async def root():
-    return {"status": "ok", "bot": "SochiSiriusEventsBot", "version": BOT_VERSION, "events": len(EVENTS), "last_update": LAST_UPDATE.isoformat() if LAST_UPDATE else None}
-
-
-@app.api_route("/health", methods=["GET", "HEAD"])
-async def health():
-    return {"status": "ok", "version": BOT_VERSION, "events": len(EVENTS)}
-
-
-async def collector_loop():
-    while True:
-        try:
-            await collect_events()
-        except Exception:
-            logger.exception("Ошибка фонового сборщика")
-        await asyncio.sleep(1800)
-
-
-async def bot_loop():
-    await bot.delete_webhook(drop_pending_updates=True)
-    await dp.start_polling(bot)
-
-
-async def main():
-    load_calendar_added_log()
-    load_subscribers()
-    await collect_events()
-    collector_task = asyncio.create_task(collector_loop())
-    bot_task = asyncio.create_task(bot_loop())
-    daily_highlight_task = asyncio.create_task(daily_highlight_loop())
-    config = uvicorn.Config(app, host="0.0.0.0", port=int(os.getenv("PORT", "10000")), log_level="info")
-    server = uvicorn.Server(config)
-    web_task = asyncio.create_task(server.serve())
-    try:
-        await asyncio.gather(collector_task, bot_task, web_task)
-    finally:
-        collector_task.cancel()
-        bot_task.cancel()
-        daily_highlight_task.cancel()
-        web_task.cancel()
-        await bot.session.close()
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
