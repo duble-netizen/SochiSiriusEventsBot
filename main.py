@@ -23,7 +23,7 @@ import uvicorn
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("sochi_events_bot")
 
-BOT_VERSION = "3.0.0-OUTLOOK-ICS"
+BOT_VERSION = "3.1.0-OUTLOOK-TELEGRAM-MAIN"
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OUTLOOK_ICS_URL = os.getenv("OUTLOOK_ICS_URL")
 CHANNEL_ID = os.getenv("CHANNEL_ID", "@SochiSiriusEvents")
@@ -56,10 +56,6 @@ GENERIC_WORDS = {
     "все мероприятия", "ближайшие мероприятия",
 }
 
-SERVICE_WORDS = (
-    "экскурси", "посещение", "прогулка", "прокат", "аренда",
-    "трансфер", "услуга", "билет", "тур", "мастер-класс",
-)
 PERMANENT_WORDS = (
     "каждый день", "ежедневно", "еженедельно", "регулярно",
     "постоянно", "экскурси", "посещение", "программа дня",
@@ -501,66 +497,30 @@ def mark_publication(kind, day):
     save_json(PUBLICATIONS_FILE, data)
 
 
-def significance_score(event):
-    title = clean(event["title"]).lower()
-    score = 0
-    if event["cancelled"]:
-        return -10000
-    if event["type"] == "Постоянные":
-        score -= 30
-    if any(w in title for w in SERVICE_WORDS):
-        score -= 20
-    for word, points in {
-        "фестиваль": 18, "концерт": 16, "премьера": 18, "финал": 18,
-        "чемпионат": 17, "турнир": 14, "спектакль": 15, "театр": 13,
-        "балет": 14, "опера": 14, "шоу": 14, "марафон": 14,
-        "кубок": 13, "выставка": 11, "открытие": 13, "праздник": 12,
-        "оркестр": 12, "симфони": 12,
-    }.items():
-        if word in title:
-            score += points
-    if event["category"] == "Спорт":
-        score += 5
-    if event["area"] == "Сириус":
-        score += 2
-    if event["free"]:
-        score += 1
-    if event.get("image_url"):
-        score += 2
-    today = datetime.now(MOSCOW_TZ).date()
-    delta = (event["date"].astimezone(MOSCOW_TZ).date() - today).days
-    if delta == 0:
-        score += 15
-        if event["date"].astimezone(MOSCOW_TZ) < datetime.now(MOSCOW_TZ):
-            score -= 20
-    elif delta == 1:
-        score += 6
-    return score
+def telegram_main_number(event):
+    """Return the TELEGRAM_MAIN marker number from the Outlook event body."""
+    text = f'{event.get("description", "")} {event.get("title", "")}'
+    match = re.search(r"\bTELEGRAM_MAIN\s*:\s*(\d+)", text, re.I)
+    return int(match.group(1)) if match else None
 
 
 def highlight_candidates():
-    today = datetime.now(MOSCOW_TZ).date()
-    pool = [
+    """Return only events explicitly marked TELEGRAM_MAIN in Outlook Calendar."""
+    now = datetime.now(MOSCOW_TZ)
+    today = now.date()
+    marked = [
         e for e in EVENTS
         if e["date"].astimezone(MOSCOW_TZ).date() == today
         and not e["cancelled"]
-        and e["date"] > datetime.now(MOSCOW_TZ)
-        and e["type"] == "Разовые"
-        and not any(w in clean(e["title"]).lower() for w in SERVICE_WORDS)
+        and e["date"] > now
+        and telegram_main_number(e) is not None
     ]
-    pool.sort(key=significance_score, reverse=True)
-
-    result = []
-    seen = set()
-    for e in pool:
-        key = normalized_title(e["title"])
-        if key in seen:
-            continue
-        result.append(e)
-        seen.add(key)
-        if len(result) == 3:
-            break
-    return result
+    marked.sort(key=lambda e: (
+        telegram_main_number(e),
+        e["date"],
+        normalized_title(e["title"]),
+    ))
+    return marked
 
 
 def proposal_text(event, number):
@@ -622,12 +582,12 @@ async def send_highlight_proposals(chat_id):
         HIGHLIGHT_PROPOSALS[chat_id] = candidates
         await bot.send_message(
             chat_id,
-            "<b>⭐ Главное событие дня</b>\n\nВыбери один из 3 вариантов. Публикация произойдёт только после твоего выбора.",
+            "<b>⭐ Главное событие дня</b>\n\nВыбери нужное событие. Публикация произойдёт только после твоего выбора.",
             parse_mode="HTML",
         )
         for i, event in enumerate(candidates):
             kb = InlineKeyboardMarkup(inline_keyboard=[[
-                InlineKeyboardButton(text=f"Выбрать вариант {i+1}", callback_data=f"highlight:{i}")
+                InlineKeyboardButton(text=f"Выбрать событие {i+1}", callback_data=f"highlight:{i}")
             ]])
             text = proposal_text(event, i + 1)
             image = await asyncio.to_thread(fetch_image_sync, event)
@@ -798,7 +758,7 @@ async def help_cmd(message: Message):
         "/today — сегодня\n"
         "/tomorrow — завтра\n"
         "/week — 7 дней\n"
-        "/главное — предложить 3 кандидата\n"
+        "/главное — показать события с меткой TELEGRAM_MAIN\n"
         "/стоп — остановить автоматическое предложение главного\n"
         "/source — источник данных\n"
         "/version — версия",
