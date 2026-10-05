@@ -14,7 +14,6 @@ from aiogram import Bot, Dispatcher
 from aiogram.filters import Command
 from aiogram.types import (
     Message, ReplyKeyboardMarkup, KeyboardButton,
-    InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery,
     BufferedInputFile,
 )
 from zoneinfo import ZoneInfo
@@ -23,7 +22,7 @@ import uvicorn
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("sochi_events_bot")
 
-BOT_VERSION = "3.1.0-OUTLOOK-TELEGRAM-MAIN"
+BOT_VERSION = "3.1.1-OUTLOOK-ICS"
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OUTLOOK_ICS_URL = os.getenv("OUTLOOK_ICS_URL")
 CHANNEL_ID = os.getenv("CHANNEL_ID", "@SochiSiriusEvents")
@@ -43,10 +42,7 @@ LAST_UPDATE = None
 SUBSCRIBERS_FILE = os.getenv("SUBSCRIBERS_FILE", "subscribers.json")
 PUBLICATIONS_FILE = os.getenv("PUBLICATIONS_FILE", "daily_publications.json")
 SUBSCRIBERS = set()
-HIGHLIGHT_PROPOSALS = {}
-HIGHLIGHT_SENDING = False
-AUTO_HIGHLIGHT_ENABLED = True
-HEADERS = {"User-Agent": "SochiSiriusEventsBot/3.0"}
+HEADERS = {"User-Agent": "SochiSiriusEventsBot/3.1.1"}
 
 AREA_ORDER = ["Сочи", "Сириус", "Красная Поляна"]
 TYPE_ORDER = ["Разовые", "Постоянные"]
@@ -497,45 +493,6 @@ def mark_publication(kind, day):
     save_json(PUBLICATIONS_FILE, data)
 
 
-def telegram_main_number(event):
-    """Return the TELEGRAM_MAIN marker number from the Outlook event body."""
-    text = f'{event.get("description", "")} {event.get("title", "")}'
-    match = re.search(r"\bTELEGRAM_MAIN\s*:\s*(\d+)", text, re.I)
-    return int(match.group(1)) if match else None
-
-
-def highlight_candidates():
-    """Return only events explicitly marked TELEGRAM_MAIN in Outlook Calendar."""
-    now = datetime.now(MOSCOW_TZ)
-    today = now.date()
-    marked = [
-        e for e in EVENTS
-        if e["date"].astimezone(MOSCOW_TZ).date() == today
-        and not e["cancelled"]
-        and e["date"] > now
-        and telegram_main_number(e) is not None
-    ]
-    marked.sort(key=lambda e: (
-        telegram_main_number(e),
-        e["date"],
-        normalized_title(e["title"]),
-    ))
-    return marked
-
-
-def proposal_text(event, number):
-    dt = event["date"].astimezone(MOSCOW_TZ)
-    text = (
-        f"<b>⭐ Вариант {number}</b>\n\n"
-        f"<b>{html.escape(event['title'])}</b>\n"
-        f"📅 {dt.strftime('%d.%m.%Y, %H:%M')}\n"
-        f"📍 {html.escape(display_location(event))}\n"
-    )
-    if event.get("url"):
-        text += f'\n🔗 <a href="{html.escape(event["url"], quote=True)}">Официальная страница / источник</a>'
-    return text
-
-
 def fetch_image_sync(event):
     if event.get("image_url"):
         url = event["image_url"]
@@ -567,59 +524,6 @@ def fetch_image_sync(event):
         return BufferedInputFile(r.content, filename="poster" + ext)
     except Exception:
         return None
-
-
-async def send_highlight_proposals(chat_id):
-    global HIGHLIGHT_SENDING
-    if HIGHLIGHT_SENDING:
-        return
-    candidates = highlight_candidates()
-    if not candidates:
-        await bot.send_message(chat_id, "На сегодня не нашёл подходящих кандидатов на главное событие.")
-        return
-    HIGHLIGHT_SENDING = True
-    try:
-        HIGHLIGHT_PROPOSALS[chat_id] = candidates
-        await bot.send_message(
-            chat_id,
-            "<b>⭐ Главное событие дня</b>\n\nВыбери нужное событие. Публикация произойдёт только после твоего выбора.",
-            parse_mode="HTML",
-        )
-        for i, event in enumerate(candidates):
-            kb = InlineKeyboardMarkup(inline_keyboard=[[
-                InlineKeyboardButton(text=f"Выбрать событие {i+1}", callback_data=f"highlight:{i}")
-            ]])
-            text = proposal_text(event, i + 1)
-            image = await asyncio.to_thread(fetch_image_sync, event)
-            if image:
-                await bot.send_photo(chat_id, image, caption=text, parse_mode="HTML", reply_markup=kb)
-            else:
-                await bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=kb)
-    finally:
-        HIGHLIGHT_SENDING = False
-
-
-async def publish_highlight(event):
-    dt = event["date"].astimezone(MOSCOW_TZ)
-    text = (
-        f"<b>⭐ Главное событие сегодня</b>\n\n"
-        f"<b>{html.escape(event['title'])}</b>\n"
-        f"📅 {dt.strftime('%d.%m.%Y, %H:%M')}\n"
-        f"📍 {html.escape(display_location(event))}\n"
-    )
-    if event.get("url"):
-        text += f'\n🔗 <a href="{html.escape(event["url"], quote=True)}">Страница события</a>'
-
-    image = await asyncio.to_thread(fetch_image_sync, event)
-    try:
-        if image:
-            await bot.send_photo(CHANNEL_ID, image, caption=text, parse_mode="HTML")
-        else:
-            await bot.send_message(CHANNEL_ID, text, parse_mode="HTML", disable_web_page_preview=False)
-        return True
-    except Exception:
-        logger.exception("Ошибка публикации главного события")
-        return False
 
 
 def daily_summary_text():
@@ -668,22 +572,6 @@ async def daily_schedule_loop():
         await asyncio.sleep(30)
 
 
-async def daily_highlight_loop():
-    sent_day = None
-    while True:
-        now = datetime.now(MOSCOW_TZ)
-        # Окно 12:00–12:15, предложение трёх кандидатов.
-        if AUTO_HIGHLIGHT_ENABLED and now.hour == 12 and 0 <= now.minute <= 15 and sent_day != now.date():
-            candidates = highlight_candidates()
-            if candidates:
-                # Предложение получает владелец/первый подписчик.
-                targets = list(SUBSCRIBERS)
-                if targets:
-                    await send_highlight_proposals(targets[0])
-                sent_day = now.date()
-        await asyncio.sleep(30)
-
-
 @dp.message(Command("start"))
 async def start(message: Message):
     SUBSCRIBERS.add(message.chat.id)
@@ -725,20 +613,6 @@ async def week_cmd(message: Message):
     await send_event_list(message, events, "Ближайшие 7 дней")
 
 
-@dp.message(Command("главное"))
-async def main_cmd(message: Message):
-    SUBSCRIBERS.add(message.chat.id)
-    save_subscribers()
-    await send_highlight_proposals(message.chat.id)
-
-
-@dp.message(lambda m: (m.text or "").lower() in {"/стоп", "/stop"})
-async def stop_cmd(message: Message):
-    global AUTO_HIGHLIGHT_ENABLED
-    AUTO_HIGHLIGHT_ENABLED = False
-    await message.answer("🛑 Автоматическое предложение главного события остановлено. Остальные функции продолжают работать.", reply_markup=menu(message.from_user.id))
-
-
 @dp.message(Command("source"))
 @dp.message(lambda m: (m.text or "").split()[0].lower() == "/источник")
 async def source_cmd(message: Message):
@@ -758,8 +632,6 @@ async def help_cmd(message: Message):
         "/today — сегодня\n"
         "/tomorrow — завтра\n"
         "/week — 7 дней\n"
-        "/главное — показать события с меткой TELEGRAM_MAIN\n"
-        "/стоп — остановить автоматическое предложение главного\n"
         "/source — источник данных\n"
         "/version — версия",
         parse_mode="HTML",
@@ -841,26 +713,6 @@ async def free_filter(message: Message):
     await message.answer("Фильтр бесплатных обновлён.", reply_markup=menu(message.from_user.id))
 
 
-@dp.callback_query(lambda c: c.data and c.data.startswith("highlight:"))
-async def highlight_callback(callback: CallbackQuery):
-    chat_id = callback.message.chat.id if callback.message else callback.from_user.id
-    candidates = HIGHLIGHT_PROPOSALS.get(chat_id, [])
-    try:
-        index = int(callback.data.split(":", 1)[1])
-    except Exception:
-        index = -1
-    if index < 0 or index >= len(candidates):
-        await callback.answer("Варианты уже устарели.", show_alert=True)
-        return
-
-    event = candidates[index]
-    ok = await publish_highlight(event)
-    await callback.answer("Опубликовано" if ok else "Ошибка публикации")
-    if ok:
-        HIGHLIGHT_PROPOSALS.pop(chat_id, None)
-        await callback.message.answer(f"✅ Опубликовано: <b>{html.escape(event['title'])}</b>", parse_mode="HTML")
-
-
 @app.get("/")
 async def root():
     return {
@@ -899,7 +751,6 @@ async def main():
         asyncio.create_task(refresh_loop()),
         asyncio.create_task(bot_loop()),
         asyncio.create_task(daily_schedule_loop()),
-        asyncio.create_task(daily_highlight_loop()),
     ]
     server = uvicorn.Server(
         uvicorn.Config(app, host="0.0.0.0", port=int(os.getenv("PORT", "10000")), log_level="info")
