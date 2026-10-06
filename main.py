@@ -22,7 +22,7 @@ import uvicorn
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("sochi_events_bot")
 
-BOT_VERSION = "3.1.1-OUTLOOK-ICS"
+BOT_VERSION = "3.1.2-OUTLOOK-ICS"
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OUTLOOK_ICS_URL = os.getenv("OUTLOOK_ICS_URL")
 CHANNEL_ID = os.getenv("CHANNEL_ID", "@SochiSiriusEvents")
@@ -42,7 +42,13 @@ LAST_UPDATE = None
 SUBSCRIBERS_FILE = os.getenv("SUBSCRIBERS_FILE", "subscribers.json")
 PUBLICATIONS_FILE = os.getenv("PUBLICATIONS_FILE", "daily_publications.json")
 SUBSCRIBERS = set()
-HEADERS = {"User-Agent": "SochiSiriusEventsBot/3.1.1"}
+HEADERS = {"User-Agent": "SochiSiriusEventsBot/3.1.2"}
+
+# Telegram main-event workflow:
+# Outlook marks candidates with TELEGRAM_MAIN: 1/2/3.
+HIGHLIGHT_PROPOSALS = {}
+HIGHLIGHT_SENDING = False
+
 
 AREA_ORDER = ["Сочи", "Сириус", "Красная Поляна"]
 TYPE_ORDER = ["Разовые", "Постоянные"]
@@ -526,6 +532,74 @@ def fetch_image_sync(event):
         return None
 
 
+def telegram_main_number(event):
+    """Read TELEGRAM_MAIN marker from Outlook event text."""
+    text = f"{event.get('description', '')}\n{event.get('location', '')}"
+    m = re.search(r'(?i)\bTELEGRAM_MAIN\s*[:=]\s*([123])\b', text)
+    return int(m.group(1)) if m else None
+
+
+def telegram_main_candidates(day=None):
+    if day is None:
+        day = datetime.now(MOSCOW_TZ).date()
+    candidates = []
+    for event in get_events_for_day(day):
+        n = telegram_main_number(event)
+        if n is not None:
+            candidates.append((n, event))
+    candidates.sort(key=lambda x: x[0])
+    return [event for _, event in candidates[:3]]
+
+
+def proposal_text(event, number):
+    dt = event["date"].astimezone(MOSCOW_TZ)
+    return (
+        f"<b>#{number} — {html.escape(event['title'])}</b>\n"
+        f"{dt.strftime('%d.%m.%Y %H:%M')} — {html.escape(display_location(event))}\n"
+        f"Источник: "
+        f"<a href=\"{html.escape(event['url'], quote=True)}\">страница события</a>"
+        if event.get("url") else
+        f"<b>#{number} — {html.escape(event['title'])}</b>\n"
+        f"{dt.strftime('%d.%m.%Y %H:%M')} — {html.escape(display_location(event))}"
+    )
+
+
+async def send_highlight_proposals(chat_id):
+    candidates = telegram_main_candidates()
+    if len(candidates) < 3:
+        await bot.send_message(
+            chat_id,
+            f"В Outlook помечено только {len(candidates)} из 3 событий "
+            f"с TELEGRAM_MAIN на сегодня.",
+        )
+        return
+
+    HIGHLIGHT_PROPOSALS[chat_id] = candidates
+    from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="1", callback_data="highlight:0"),
+            InlineKeyboardButton(text="2", callback_data="highlight:1"),
+            InlineKeyboardButton(text="3", callback_data="highlight:2"),
+        ]
+    ])
+    text = "<b>Выбери событие для публикации в Telegram</b>\n\n"
+    text += "\n\n".join(
+        proposal_text(event, i + 1) for i, event in enumerate(candidates)
+    )
+    await bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=keyboard)
+
+
+async def publish_highlight(event):
+    text = event_text(event)
+    image = await asyncio.to_thread(fetch_image_sync, event)
+    if image:
+        await bot.send_photo(CHANNEL_ID, image, caption=text, parse_mode="HTML")
+    else:
+        await bot.send_message(CHANNEL_ID, text, parse_mode="HTML", disable_web_page_preview=False)
+
+
+
 def daily_summary_text():
     day = datetime.now(MOSCOW_TZ).date()
     events = get_events_for_day(day)
@@ -562,14 +636,48 @@ async def publish_daily_summary():
 
 
 async def daily_schedule_loop():
-    sent_day = None
+    sent_daily_day = None
+    sent_highlight_day = None
     while True:
         now = datetime.now(MOSCOW_TZ)
-        # Окно 11:00–11:30, фактическая отправка в 11:05.
-        if now.hour == 11 and 5 <= now.minute <= 30 and sent_day != now.date():
+        day = now.date()
+
+        # 10:00–10:30: publish the complete Outlook agenda for today.
+        if now.hour == 10 and 0 <= now.minute <= 30 and sent_daily_day != day:
             await publish_daily_summary()
-            sent_day = now.date()
+            sent_daily_day = day
+
+        # 11:00–11:30: offer exactly the three Outlook-marked candidates.
+        if now.hour == 11 and 0 <= now.minute <= 30 and sent_highlight_day != day:
+            targets = list(SUBSCRIBERS)
+            if targets:
+                await send_highlight_proposals(targets[0])
+            sent_highlight_day = day
+
         await asyncio.sleep(30)
+
+
+@dp.callback_query(lambda c: c.data and c.data.startswith("highlight:"))
+async def highlight_callback(callback):
+    try:
+        index = int(callback.data.split(":", 1)[1])
+        candidates = HIGHLIGHT_PROPOSALS.get(callback.from_user.id, [])
+        if index < 0 or index >= len(candidates):
+            await callback.answer("Предложение устарело.", show_alert=True)
+            return
+        event = candidates[index]
+        await publish_highlight(event)
+        await callback.answer("Опубликовано")
+        await callback.message.edit_reply_markup(reply_markup=None)
+        await callback.message.answer(
+            f"Опубликовано в канал: <b>{html.escape(event['title'])}</b>",
+            parse_mode="HTML",
+        )
+        HIGHLIGHT_PROPOSALS.pop(callback.from_user.id, None)
+    except Exception:
+        logger.exception("Ошибка публикации выбранного главного события")
+        await callback.answer("Не удалось опубликовать.", show_alert=True)
+
 
 
 @dp.message(Command("start"))
